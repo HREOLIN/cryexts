@@ -1,6 +1,95 @@
 ﻿// SPDX-License-Identifier: GPL-2.0
 #include "cryexts.h"
 
+static void cryexts_copy_gdt_to_blocks(struct cryexts_sb_info *sbi)
+{
+	u64 index;
+
+	if (!sbi->gdt_bhs || !sbi->gdt_storage)
+		return;
+
+	for (index = 0; index < sbi->group_desc_table_blocks; index++) {
+		if (!sbi->gdt_bhs[index])
+			continue;
+		memcpy(sbi->gdt_bhs[index]->b_data,
+		       sbi->gdt_storage + index * CRYEXTS_BLOCK_SIZE,
+		       CRYEXTS_BLOCK_SIZE);
+	}
+}
+
+int cryexts_load_group_desc_table(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	u64 bytes;
+	u64 index;
+
+	if (le32_to_cpu(sbi->disk_sb->version) < CRYEXTS_VERSION_V4)
+		return 0;
+	if (!sbi->group_desc_table_blocks)
+		return -EINVAL;
+
+	sbi->gdt_bhs = kcalloc(sbi->group_desc_table_blocks,
+			       sizeof(*sbi->gdt_bhs), GFP_KERNEL);
+	if (!sbi->gdt_bhs)
+		return -ENOMEM;
+
+	bytes = sbi->group_desc_table_blocks * CRYEXTS_BLOCK_SIZE;
+	sbi->gdt_storage = kzalloc(bytes, GFP_KERNEL);
+	if (!sbi->gdt_storage) {
+		cryexts_release_group_desc_table(sbi);
+		return -ENOMEM;
+	}
+
+	for (index = 0; index < sbi->group_desc_table_blocks; index++) {
+		sbi->gdt_bhs[index] =
+			sb_bread(sb, sbi->group_desc_table_start + index);
+		if (!sbi->gdt_bhs[index]) {
+			pr_err("cryexts: failed to read GDT at block %llu\n",
+			       sbi->group_desc_table_start + index);
+			cryexts_release_group_desc_table(sbi);
+			return -EIO;
+		}
+		memcpy(sbi->gdt_storage + index * CRYEXTS_BLOCK_SIZE,
+		       sbi->gdt_bhs[index]->b_data, CRYEXTS_BLOCK_SIZE);
+	}
+
+	sbi->groups = (struct cryexts_group_desc *)sbi->gdt_storage;
+	return 0;
+}
+
+void cryexts_release_group_desc_table(struct cryexts_sb_info *sbi)
+{
+	u64 index;
+
+	if (!sbi)
+		return;
+
+	if (sbi->gdt_bhs) {
+		for (index = 0; index < sbi->group_desc_table_blocks; index++) {
+			if (sbi->gdt_bhs[index])
+				brelse(sbi->gdt_bhs[index]);
+		}
+		kfree(sbi->gdt_bhs);
+		sbi->gdt_bhs = NULL;
+	}
+
+	kfree(sbi->gdt_storage);
+	sbi->gdt_storage = NULL;
+	sbi->groups = NULL;
+}
+
+void cryexts_gdt_prepare_write(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+
+	if (!sbi || !sbi->gdt_storage)
+		return;
+
+	if (cryexts_metadata_csum_enabled(sb))
+		cryexts_update_group_checksums(sb);
+	cryexts_copy_gdt_to_blocks(sbi);
+}
+
 static int cryexts_validate_super(struct super_block *sb)
 {
 	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
@@ -109,6 +198,15 @@ static int cryexts_validate_super(struct super_block *sb)
 			return -EINVAL;
 		if (!le64_to_cpu(disk_sb->group_desc_table_start) ||
 		    !le64_to_cpu(disk_sb->group_desc_table_blocks))
+			return -EINVAL;
+		if (le64_to_cpu(disk_sb->group_desc_table_start) +
+			    le64_to_cpu(disk_sb->group_desc_table_blocks) >
+		    blocks_count)
+			return -EINVAL;
+		if (le64_to_cpu(disk_sb->group_count) *
+			    sizeof(struct cryexts_group_desc) >
+		    le64_to_cpu(disk_sb->group_desc_table_blocks) *
+			    CRYEXTS_BLOCK_SIZE)
 			return -EINVAL;
 		if ((compat & CRYEXTS_FEATURE_COMPAT_HAS_JOURNAL) &&
 		    (!journal_block || !journal_blocks ||
@@ -273,7 +371,7 @@ static void cryexts_put_super(struct super_block *sb)
 	memzero_explicit(sbi->derived_key, sizeof(sbi->derived_key));
 	sbi->derived_key_len = 0;
 	cryexts_unload_bitmaps(sbi);
-	brelse(sbi->gdt_bh);
+	cryexts_release_group_desc_table(sbi);
 	brelse(sbi->s_sbh);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
@@ -306,21 +404,25 @@ int cryexts_sync_metadata(struct super_block *sb)
 	if (!sbi)
 		return 0;
 
+	if (sbi->gdt_bhs)
+		cryexts_gdt_prepare_write(sb);
+
 	if (cryexts_metadata_csum_enabled(sb)) {
-		if (sbi->gdt_bh) {
-			cryexts_update_group_checksums(sb);
-			mark_buffer_dirty(sbi->gdt_bh);
-		}
 		if (sbi->s_sbh) {
 			cryexts_update_super_checksum(sb);
 			mark_buffer_dirty(sbi->s_sbh);
 		}
 	}
 
-	if (sbi->gdt_bh) {
-		err = sync_dirty_buffer(sbi->gdt_bh);
-		if (err)
-			return err;
+	if (sbi->gdt_bhs) {
+		for (group = 0; group < sbi->group_desc_table_blocks; group++) {
+			if (!sbi->gdt_bhs[group])
+				continue;
+			mark_buffer_dirty(sbi->gdt_bhs[group]);
+			err = sync_dirty_buffer(sbi->gdt_bhs[group]);
+			if (err)
+				return err;
+		}
 	}
 	if (sbi->block_bitmap_bh) {
 		err = sync_dirty_buffer(sbi->block_bitmap_bh);
@@ -451,14 +553,9 @@ static int cryexts_fill_super(struct super_block *sb, void *data, int silent)
 		goto failed;
 	}
 	if (le32_to_cpu(disk_sb->version) >= CRYEXTS_VERSION_V4) {
-		sbi->gdt_bh = sb_bread(sb, sbi->group_desc_table_start);
-		if (!sbi->gdt_bh) {
-			pr_err("cryexts: failed to read GDT at block %llu\n",
-			       sbi->group_desc_table_start);
-			ret = -EIO;
+		ret = cryexts_load_group_desc_table(sb);
+		if (ret)
 			goto failed;
-		}
-		sbi->groups = (struct cryexts_group_desc *)sbi->gdt_bh->b_data;
 		ret = cryexts_verify_group_checksums(sb);
 		if (ret) {
 			pr_err("cryexts: group checksum validation failed (%d)\n",

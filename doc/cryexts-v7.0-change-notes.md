@@ -1,208 +1,226 @@
 # CRYEXTS v7.0 变更说明
 
-## 1. 这一版做了什么
+## 1. v7.0 的新定义
 
-`v7.0` 不是新的磁盘结构版本，而是 `Version 7` 的第一步：
+现在的 `v7.0` 已经不再沿用早期那种：
 
 ```text
 USB demo baseline
 ```
 
-这一版重点不是增加新的 inode / extent / journal 结构，而是把 `Version 6 MVP` 收口成一组更稳定的 demo 入口和文档入口。
+的定义。
 
-完成内容：
-
-- 新增 `scripts/smoke_version6_mvp.sh`
-- 新增 `scripts/smoke_v7_0_usb_demo.sh`
-- 新增 `scripts/smoke_version7_demo.sh`
-- 新增 USB demo guide
-- 补一份 `v7.0` 变更说明
-
-## 2. 为什么 v7.0 不先加新功能
-
-因为 `Version 6` 刚刚完成的是“功能闭环”。
-
-现在最需要补的不是：
-
-- 更多 feature
-
-而是：
-
-- 更稳定的演示路径
-- 更清楚的风险边界
-- 更标准化的脚本入口
-
-所以 `v7.0` 的定位是：
+在 Version 7 需求重构之后，真正的第一阶段目标变成了：
 
 ```text
-先把已有能力变成可部署、可演示、可复现
+先突破单块 GDT 限制，建立可扩展容量的磁盘布局基线
 ```
 
-## 3. 新增脚本说明
+所以这一版的核心不是新增用户可见功能，而是先把底层布局扩展能力立起来：
 
-### 3.1 `smoke_version6_mvp.sh`
+- 让 `mkfs.cryexts` 能真正写出多块 GDT
+- 让当前尚未升级的 mount / fsck 路径“明确拒绝”多块 GDT，而不是误读
+- 补齐 inspect / smoke / 文档，形成 Version 7 的新主线入口
 
-作用：
-
-- 串跑 `v6.0` 到 `v6.6`
-- 用一个脚本证明 `Version 6` 基线完整
-
-### 3.2 `smoke_v7_0_usb_demo.sh`
-
-作用：
-
-- 建立 `v7.0` USB demo baseline
-- 支持：
-  - image mode
-  - raw-device mode
-
-image mode：
+一句话概括：
 
 ```text
-在 U 盘外层宿主文件系统里放一个 cryexts 镜像文件
--> loop mount
+v7.0 = Version 7 的多块 GDT 基线版
 ```
 
-raw-device mode：
+## 2. 这版具体改了什么
+
+### 2.1 `tools/mkfs.cryexts.c`
+
+`mkfs` 现在把 `group_desc_table_blocks` 当成真实布局参数来处理，不再默认它永远等于 `1`。
+
+新的行为：
+
+- 计算：
 
 ```text
-直接对真实分区做 mkfs/mount
+gdt_blocks =
+  ceil(group_count * sizeof(group_desc) / block_size)
 ```
 
-### 3.3 `smoke_version7_demo.sh`
+- group0 的元数据布局不再写死在 `block 2 / 3 / 4`
+- root group 的 block bitmap、inode bitmap、inode table、root dir 会整体后移
+- GDT 会先在一段连续内存里组装，再一次性写出完整 GDT 区域
+- `mkfs` 输出里新增 `GDT blocks:` 方便排查
 
-作用：
+这意味着：
 
-- 先跑 `Version 6` 基线
-- 再跑 `v7.0` demo baseline
-
-这让 `Version 7` 的演示不是脱离技术基线单独存在，而是建立在完整版本线之上。
-
-## 4. `smoke_v7_0_usb_demo.sh` 在测什么
-
-它会覆盖：
-
-- `mkfs.cryexts`
-- `cryextsck`
-- mount / umount / remount
-- 普通文件写入和读取
-- hard link / symlink / rename
-- 简单 xattr
-- 大文件复制
-- sparse file
-- 多目录项创建
-- sync 后的一致性检查
-
-如果设置了 `KEY`，还会额外走一条加密 demo 路径。
-
-## 5. 这一版的核心设计决定
-
-`v7.0` 刻意不引入新的 on-disk 结构。
-
-原因是：
-
-- `Version 6` 刚刚完成结构型 MVP
-- `Version 7` 首先需要解决的是“怎么把它拿出去稳定演示”
-
-所以 `v7.0` 更像一版：
+- 当 group 数量超过单块 GDT 能容纳的上限时
+- `mkfs` 不会再直接报：
 
 ```text
-release engineering / demo engineering baseline
+Current v4.1 mkfs supports only one GDT block
 ```
 
-## 6. image mode 和 raw mode 的关系
+- 而是会真正把多块 GDT 写出来
 
-`v7.0` 明确支持两种模式，但优先级不同。
+### 2.2 `super.c`
 
-### 6.1 image mode
+当前内核挂载路径还没有升级成“读取完整多块 GDT”模型。
 
-这是默认模式。
+所以 v7.0 的策略不是“硬读”，而是“安全拒绝”：
 
-优点：
+- 校验 GDT 区域是否越界
+- 校验 `group_desc_table_blocks * block_size` 是否足够容纳全部 descriptors
+- 如果发现 `group_desc_table_blocks > 1`
+  - 明确报错
+  - 拒绝继续挂载
 
-- 风险最低
-- 便于脚本化
-- 更适合当前实验型阶段
-
-### 6.2 raw mode
-
-这是更接近真实部署的模式。
-
-但这版明确做了保护：
-
-- 需要 `TARGET_DEVICE`
-- 需要 `ACK_RAW_DEVICE=I_UNDERSTAND_THE_RISK`
-- 只接受分区风格设备名
-
-这说明 `v7.0` 已经开始把“设备级安全防呆”纳入脚本设计。
-
-## 7. 文档方面补了什么
-
-新增：
-
-- [doc/cryexts-usb-demo-guide.md](/D:/Carl/cryptext4/cryexts/doc/cryexts-usb-demo-guide.md:1)
-
-这份文档专门解释：
-
-- `v7.0` 的定位
-- 两种 demo 方式
-- 脚本参数
-- 执行顺序
-- 风险边界
-- 需要提供给后续定制流程的 U 盘信息
-
-## 8. 当前边界
-
-`v7.0` 已经实现：
-
-- `Version 6` 总 smoke 入口
-- `Version 7` USB demo baseline 入口
-- image / raw 两种模式的统一脚本框架
-- 基础风险防呆
-- 基础使用说明
-
-`v7.0` 还没有实现：
-
-- 真机长期 stress
-- 更系统化 fault injection
-- 完整开源发布文档包
-- 商用评估材料包
-
-所以这版最准确的定位是：
+现在的报错语义是：
 
 ```text
-Version 7 的第一步
+multi-block GDT is not yet supported by mount path
 ```
 
-不是：
+这样做的目的很明确：
+
+- 防止旧代码只读取第一块 GDT
+- 导致后续 descriptor 被静默丢失
+- 进而把整个文件系统解释错
+
+### 2.3 `tools/cryextsck.c`
+
+`cryextsck` 当前也还是单块 GDT 模型。
+
+所以 v7.0 同样给它加了两层保护：
+
+- 在 `validate_super()` 中校验完整 GDT 区域的大小是否合法
+- 在真正读取 GDT 之前，如果发现 `group_desc_table_blocks > 1`
+  - 明确报不支持
+  - 不再假装只读第一块继续跑
+
+当前拒绝信息是：
 
 ```text
-Version 7 全部完成
+multi-block GDT is not yet supported by cryextsck
 ```
 
-## 9. 下一步自然会接什么
+这说明：
 
-`v7.0` 之后最自然的推进顺序是：
+- `mkfs` 已经先走到 Version 7 的第一步
+- 但 mount 和 fsck 还处在“兼容保护阶段”
 
-1. `v7.1`
-   stress / fault injection baseline
+### 2.4 新增工具 `tools/cryexts_gdt_inspect.c`
 
-2. `v7.2`
-   open source packaging
+这个工具是 v7.0 里最重要的新检查工具。
 
-3. `v7.3`
-   commercial evaluation package
+它的作用是：
 
-## 10. 一句话总结
+- 直接读取整段 GDT 区域
+- 打印 superblock 里和 GDT 相关的关键字段
+- 逐个打印 group descriptor
+- 如果启用了 metadata checksum，再打印每个 group 的 stored / expected checksum
 
-如果 `Version 6` 解决的是：
+重点输出字段包括：
+
+- `gdt_start`
+- `gdt_blocks`
+- `expected_gdt_blocks`
+- `root_block_bitmap`
+- `root_inode_bitmap`
+- `root_inode_table_start`
+- `root_dir_block`
+- `group[i].start`
+- `group[i].block_bitmap`
+- `group[i].inode_table_start`
+
+这个工具的意义是：
+
+- 不依赖 mount
+- 不依赖 cryextsck
+- 先把“磁盘上到底写成什么样”直接看清楚
+
+### 2.5 新增脚本 `scripts/smoke_v7_0_multi_gdt.sh`
+
+这条脚本是新的 v7.0 主 smoke。
+
+它验证的是：
+
+1. 构造一个跨越单块 GDT 上限的大镜像
+2. 用 `mkfs.cryexts -f -G -M` 格式化
+3. 用 `cryexts_gdt_inspect` 检查：
+   - `gdt_blocks > 1`
+   - `expected_gdt_blocks == gdt_blocks`
+   - root group 元数据位置已经右移
+4. 再确认当前 `cryextsck` 会明确拒绝这个镜像
+
+所以它验证的不是“挂载成功”，而是：
 
 ```text
-文件系统功能怎么成立
+mkfs 已经能写多块 GDT
+老路径也会安全失败
 ```
 
-那么 `v7.0` 解决的是：
+这正是 v7.0 这个阶段应该达成的目标。
+
+## 3. 这一版暂时还没做什么
+
+v7.0 还没有实现：
+
+- 内核多块 GDT 完整加载
+- `sync_metadata()` 覆盖所有 GDT blocks
+- 多块 GDT 下的 journal / checksum 全路径同步
+- `cryextsck` 完整多块 GDT 读取与校验
+- 以 raw-device / USB demo 作为 Version 7 主线目标
+
+也就是说，这一版只是把：
 
 ```text
-这些能力怎么被稳定地拿去演示和交付
+“能不能创建多块 GDT 文件系统”
+```
+
+先解决掉。
+
+而：
+
+```text
+“内核能不能挂”
+“fsck 能不能全理解”
+```
+
+会放到后续版本继续推进。
+
+## 4. 为什么要这样分阶段
+
+如果不先拆开，Version 7 会一直把几类问题混在一起：
+
+- USB / raw-device 演示流程问题
+- 大容量分区问题
+- GDT 布局扩展问题
+- mount / fsck 路径升级问题
+
+这样做版本推进会很乱。
+
+重构之后，Version 7 的顺序变成：
+
+### `v7.0`
+
+- `mkfs` 写多块 GDT
+- 旧读取路径安全拒绝
+- 补 inspect / smoke / 文档
+
+### `v7.1`
+
+- 内核多块 GDT 加载与同步
+
+### `v7.2`
+
+- `cryextsck` 多块 GDT 完整支持
+
+### 更后面
+
+- 再把 raw-device / USB demo 接回主线
+
+## 5. 一句话总结
+
+`v7.0` 解决的是：
+
+```text
+让 CRYEXTS 首次具备“写出多块 GDT 文件系统”的能力，
+并且让尚未升级的读取路径明确、安全地失败。
 ```

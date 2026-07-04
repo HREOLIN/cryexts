@@ -378,8 +378,8 @@ int cryexts_validate_dir_block(struct inode *dir)
 
 		bh = sb_bread(dir->i_sb, cryexts_inode_block_at(dir, i));
 		if (!bh) {
-			pr_err("cryexts: failed to read dir block %u for parent ino=%lu while adding %.*s\n",
-			       i, dir->i_ino, name->len, name->name);
+			pr_err("cryexts: failed to read dir block %u while validating dir ino=%lu\n",
+			       i, dir->i_ino);
 			return -EIO;
 		}
 

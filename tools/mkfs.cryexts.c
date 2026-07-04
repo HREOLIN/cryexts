@@ -403,7 +403,9 @@ int main(int argc, char **argv)
 	uint64_t journal_block = 0;
 	uint64_t journal_blocks = 0;
 	uint64_t policy_table_block = 0;
+	uint64_t gdt_bytes = 0;
 	uint16_t policy_entry_count = 0;
+	unsigned char *gdt_region = NULL;
 
 	while ((opt = getopt(argc, argv, "fGXAIOTMJP:L:E:h")) != -1) {
 		switch (opt) {
@@ -510,18 +512,27 @@ int main(int argc, char **argv)
 					   CRYEXTS_DEFAULT_BLOCKS_PER_GROUP);
 		group_count = div_round_up_u64(blocks_count, blocks_per_group);
 		inodes_count = group_count * inodes_per_group;
-		if (group_count * sizeof(struct cryexts_group_desc) >
-		    CRYEXTS_BLOCK_SIZE) {
+		gdt_bytes = group_count * sizeof(struct cryexts_group_desc);
+		gdt_blocks = div_round_up_u64(gdt_bytes, CRYEXTS_BLOCK_SIZE);
+		if (CRYEXTS_GDT_START_BLOCK + gdt_blocks + 1 +
+		    1 + CRYEXTS_DEFAULT_INODE_TABLE_BLOCKS_PER_GROUP >=
+		    blocks_per_group) {
 			fprintf(stderr,
-				"Current v4.1 mkfs supports only one GDT block\n");
+				"root group metadata does not fit in one group\n");
 			close(fd);
 			return 1;
 		}
 	}
 
-	root_block_bitmap_block = use_block_groups ? 2 : CRYEXTS_BLOCK_BITMAP_BLOCK;
-	root_inode_bitmap_block = use_block_groups ? 3 : CRYEXTS_INODE_BITMAP_BLOCK;
-	root_inode_table_start = use_block_groups ? 4 : CRYEXTS_INODE_TABLE_START;
+	root_block_bitmap_block = use_block_groups ?
+		(CRYEXTS_GDT_START_BLOCK + gdt_blocks) :
+		CRYEXTS_BLOCK_BITMAP_BLOCK;
+	root_inode_bitmap_block = use_block_groups ?
+		(root_block_bitmap_block + 1) :
+		CRYEXTS_INODE_BITMAP_BLOCK;
+	root_inode_table_start = use_block_groups ?
+		(root_inode_bitmap_block + 1) :
+		CRYEXTS_INODE_TABLE_START;
 	root_dir_block = use_block_groups ?
 		root_inode_table_start + CRYEXTS_DEFAULT_INODE_TABLE_BLOCKS_PER_GROUP :
 		CRYEXTS_ROOT_DIR_BLOCK;
@@ -538,6 +549,12 @@ int main(int argc, char **argv)
 		}
 		if (policy_table_block >= blocks_count) {
 			fprintf(stderr, "Device is too small for policy table block\n");
+			close(fd);
+			return 1;
+		}
+		if (use_block_groups && policy_table_block >= blocks_per_group) {
+			fprintf(stderr,
+				"root group policy table does not fit in the root group\n");
 			close(fd);
 			return 1;
 		}
@@ -722,8 +739,15 @@ int main(int argc, char **argv)
 	}
 
 	if (use_block_groups) {
+		gdt_region = calloc(gdt_blocks, CRYEXTS_BLOCK_SIZE);
+		if (!gdt_region) {
+			perror("calloc gdt");
+			close(fd);
+			return 1;
+		}
+
 		memset(block, 0, sizeof(block));
-		groups = (struct cryexts_group_desc *)block;
+		groups = (struct cryexts_group_desc *)gdt_region;
 		for (uint64_t group = 0; group < group_count; group++) {
 			uint64_t group_start = group * blocks_per_group;
 			uint64_t group_blocks = min_u64(blocks_per_group,
@@ -779,7 +803,7 @@ int main(int argc, char **argv)
 			}
 			set_group_checksum(&checksum_sb, &groups[group]);
 		}
-		if (write_full(fd, block, sizeof(block),
+		if (write_full(fd, gdt_region, gdt_blocks * CRYEXTS_BLOCK_SIZE,
 			       CRYEXTS_GDT_START_BLOCK * CRYEXTS_BLOCK_SIZE) < 0) {
 			perror("write group desc table");
 			close(fd);
@@ -978,6 +1002,8 @@ int main(int argc, char **argv)
 	       use_block_groups ? CRYEXTS_DEFAULT_INODE_TABLE_BLOCKS_PER_GROUP :
 				  CRYEXTS_INODE_TABLE_BLOCKS);
 	printf("Groups: %llu\n", (unsigned long long)group_count);
+	if (use_block_groups)
+		printf("GDT blocks: %llu\n", (unsigned long long)gdt_blocks);
 	if (journal_blocks > 0)
 		printf("Journal: start=%llu blocks=%llu\n",
 		       (unsigned long long)journal_block,
@@ -1002,6 +1028,7 @@ int main(int argc, char **argv)
 	else
 		printf("Encrypted: no\n");
 
+	free(gdt_region);
 	close(fd);
 	return 0;
 }

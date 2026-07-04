@@ -26,6 +26,7 @@ cryexts_policy_inspect
 cryexts_journal_inspect
 cryexts_alloc_inspect
 cryexts_xattr_inspect
+cryexts_gdt_inspect
 
 Thumbs.db
 .DS_Store

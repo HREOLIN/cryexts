@@ -93,6 +93,7 @@ void cryexts_bitmap_clear(unsigned char *bitmap, u64 bit)
 void cryexts_mark_bitmap_dirty(struct cryexts_sb_info *sbi)
 {
 	u64 group;
+	u64 gdt_index;
 
 	if (sbi->group_count <= 1) {
 		if (sbi->block_bitmap_bh) {
@@ -106,10 +107,15 @@ void cryexts_mark_bitmap_dirty(struct cryexts_sb_info *sbi)
 		return;
 	}
 
-	if (sbi->gdt_bh) {
-		cryexts_update_group_checksums(sbi->sb);
-		cryexts_journal_record_bh(sbi->sb, sbi->gdt_bh);
-		mark_buffer_dirty(sbi->gdt_bh);
+	if (sbi->gdt_bhs) {
+		cryexts_gdt_prepare_write(sbi->sb);
+		for (gdt_index = 0; gdt_index < sbi->group_desc_table_blocks;
+		     gdt_index++) {
+			if (!sbi->gdt_bhs[gdt_index])
+				continue;
+			cryexts_journal_record_bh(sbi->sb, sbi->gdt_bhs[gdt_index]);
+			mark_buffer_dirty(sbi->gdt_bhs[gdt_index]);
+		}
 	}
 	for (group = 0; group < sbi->group_count; group++) {
 		if (sbi->group_block_bitmap_bhs &&

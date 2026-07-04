@@ -666,6 +666,18 @@ static int validate_super(const struct cryexts_super_block *sb)
 				report("bad group descriptor table");
 				ok = 0;
 			}
+			if (le64toh(sb->group_desc_table_start) +
+				    le64toh(sb->group_desc_table_blocks) >
+			    blocks_count) {
+				report("bad group descriptor table");
+				ok = 0;
+			}
+			if (group_count * sizeof(struct cryexts_group_desc) >
+			    le64toh(sb->group_desc_table_blocks) *
+				    CRYEXTS_BLOCK_SIZE) {
+				report("group descriptor table is too small");
+				ok = 0;
+			}
 		} else {
 			if (group_count != 1) {
 				report("bad group count");
@@ -2556,6 +2568,10 @@ int main(int argc, char **argv)
 	if (errors)
 		goto out;
 	if (has_block_groups(sb)) {
+		if (le64toh(sb->group_desc_table_blocks) > 1) {
+			report("multi-block GDT is not yet supported by cryextsck");
+			goto out;
+		}
 		if (read_full(fd, gdt_block, sizeof(gdt_block),
 			      le64toh(sb->group_desc_table_start) *
 				      CRYEXTS_BLOCK_SIZE) < 0) {
