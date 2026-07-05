@@ -7,6 +7,7 @@ IMG_NAME=${IMG_NAME:-cryexts-v7_0-demo.img}
 IMG_PATH=${IMG_PATH:-$USB_HOST_DIR/$IMG_NAME}
 TARGET_DEVICE=${TARGET_DEVICE:-}
 ACK_RAW_DEVICE=${ACK_RAW_DEVICE:-}
+ALLOW_WHOLE_DISK=${ALLOW_WHOLE_DISK:-}
 MNT=${MNT:-/tmp/cryexts-mnt}
 SIZE_MB=${SIZE_MB:-256}
 LABEL=${LABEL:-v70demo}
@@ -16,22 +17,25 @@ SPARSE_SIZE_MB=${SPARSE_SIZE_MB:-64}
 DIR_FILE_COUNT=${DIR_FILE_COUNT:-96}
 LARGE_SRC=${LARGE_SRC:-/tmp/cryexts-v7_0-large.bin}
 LARGE_DST=${LARGE_DST:-/tmp/cryexts-v7_0-large.out}
+SCRIPT_TAG=${SCRIPT_TAG:-v7.0}
+DEMO_TEXT=${DEMO_TEXT:-$SCRIPT_TAG usb demo}
+ENTRY_SCRIPT=${ENTRY_SCRIPT:-./scripts/smoke_v7_0_usb_demo.sh}
 BLOCK_SIZE=4096
 BLOCKS_PER_GROUP=4096
 GROUP_DESC_BYTES=76
-MAX_GDT_GROUPS=$((BLOCK_SIZE / GROUP_DESC_BYTES))
-MAX_RAW_DEVICE_BYTES=$((MAX_GDT_GROUPS * BLOCKS_PER_GROUP * BLOCK_SIZE))
+SINGLE_GDT_GROUPS=$((BLOCK_SIZE / GROUP_DESC_BYTES))
+SINGLE_GDT_MAX_BYTES=$((SINGLE_GDT_GROUPS * BLOCKS_PER_GROUP * BLOCK_SIZE))
 CURRENT_STEP="startup"
 
 log_step() {
 	CURRENT_STEP=$1
-	echo "[v7.0] $CURRENT_STEP"
+	echo "[$SCRIPT_TAG] $CURRENT_STEP"
 }
 
 on_error() {
 	local line_no=$1
-	echo "[v7.0] failed at step: $CURRENT_STEP (line $line_no)" >&2
-	echo "[v7.0] hint: inspect kernel log with: dmesg | tail -n 120" >&2
+	echo "[$SCRIPT_TAG] failed at step: $CURRENT_STEP (line $line_no)" >&2
+	echo "[$SCRIPT_TAG] hint: inspect kernel log with: dmesg | tail -n 120" >&2
 }
 
 cleanup() {
@@ -60,6 +64,22 @@ run_fsck() {
 	fi
 }
 
+run_gdt_inspect() {
+	if [ "$DEMO_MODE" = "raw" ]; then
+		sudo ./cryexts_gdt_inspect "$TARGET_FS"
+	else
+		./cryexts_gdt_inspect "$TARGET_FS"
+	fi
+}
+
+read_target_size_bytes() {
+	if [ "$DEMO_MODE" = "raw" ]; then
+		sudo blockdev --getsize64 "$TARGET_FS"
+	else
+		echo $((SIZE_MB * 1024 * 1024))
+	fi
+}
+
 mount_cryexts() {
 	local target=$1
 
@@ -82,6 +102,15 @@ require_raw_partition() {
 	case "$TARGET_DEVICE" in
 		/dev/sd[a-z][0-9]*|/dev/nvme[0-9]n[0-9]p[0-9]*|/dev/mmcblk[0-9]p[0-9]*|/dev/loop[0-9]*)
 			;;
+		/dev/sd[a-z]|/dev/nvme[0-9]n[0-9]|/dev/mmcblk[0-9])
+			if [ "$ALLOW_WHOLE_DISK" != "YES" ]; then
+				echo "refusing unsafe raw whole-disk target: $TARGET_DEVICE" >&2
+				echo "use a partition-like device such as /dev/sdb1" >&2
+				echo "or explicitly allow whole-disk mode with:" >&2
+				echo "  ALLOW_WHOLE_DISK=YES" >&2
+				exit 2
+			fi
+			;;
 		*)
 			echo "refusing unsafe raw target: $TARGET_DEVICE" >&2
 			echo "use a partition-like device such as /dev/sdb1" >&2
@@ -95,24 +124,26 @@ require_raw_partition() {
 	fi
 }
 
-check_raw_device_size() {
+verify_gdt_layout() {
 	local size_bytes
-	local size_mib
-	local max_mib
+	local inspect_output
+	local gdt_blocks
+	local expected_gdt_blocks
 
-	size_bytes=$(blockdev --getsize64 "$TARGET_DEVICE")
-	size_mib=$((size_bytes / 1024 / 1024))
-	max_mib=$((MAX_RAW_DEVICE_BYTES / 1024 / 1024))
+	size_bytes=$(read_target_size_bytes)
 
-	if [ "$size_bytes" -gt "$MAX_RAW_DEVICE_BYTES" ]; then
-		echo "raw-device target is too large for current mkfs.cryexts GDT implementation" >&2
-		echo "target: $TARGET_DEVICE (${size_mib} MiB)" >&2
-		echo "current max raw-device size: ${max_mib} MiB" >&2
-		echo "current mkfs supports only a single GDT block" >&2
-		echo "workarounds:" >&2
-		echo "  1) create a smaller test partition (recommended, e.g. 512 MiB or 1 GiB)" >&2
-		echo "  2) use image mode on the mounted USB host filesystem" >&2
-		exit 2
+	inspect_output=$(run_gdt_inspect)
+	printf '%s\n' "$inspect_output"
+
+	gdt_blocks=$(printf '%s\n' "$inspect_output" | awk -F= '$1=="gdt_blocks"{print $2}')
+	expected_gdt_blocks=$(printf '%s\n' "$inspect_output" | awk -F= '$1=="expected_gdt_blocks"{print $2}')
+
+	test -n "$gdt_blocks"
+	test -n "$expected_gdt_blocks"
+	test "$gdt_blocks" = "$expected_gdt_blocks"
+
+	if [ "$size_bytes" -gt "$SINGLE_GDT_MAX_BYTES" ]; then
+		test "$gdt_blocks" -gt 1
 	fi
 }
 
@@ -131,9 +162,10 @@ if [ "$DEMO_MODE" = "auto" ]; then
 		echo "auto mode could not choose demo mode" >&2
 		echo "either:" >&2
 		echo "  1) mount your USB host filesystem and use image mode" >&2
-		echo "     USB_HOST_DIR=/media/\$USER/YourUsb ./scripts/smoke_v7_0_usb_demo.sh" >&2
+		echo "     USB_HOST_DIR=/media/\$USER/YourUsb $ENTRY_SCRIPT" >&2
 		echo "  2) run raw-device mode explicitly" >&2
-		echo "     DEMO_MODE=raw TARGET_DEVICE=/dev/sdX1 ACK_RAW_DEVICE=I_UNDERSTAND_THE_RISK ./scripts/smoke_v7_0_usb_demo.sh" >&2
+		echo "     DEMO_MODE=raw TARGET_DEVICE=/dev/sdX1 ACK_RAW_DEVICE=I_UNDERSTAND_THE_RISK $ENTRY_SCRIPT" >&2
+		echo "     whole-disk mode also requires: ALLOW_WHOLE_DISK=YES" >&2
 		exit 2
 	fi
 fi
@@ -143,7 +175,8 @@ if [ "$DEMO_MODE" = "image" ]; then
 		echo "USB_HOST_DIR does not exist: $USB_HOST_DIR" >&2
 		echo "mount your USB first, or set USB_HOST_DIR to a prepared host directory" >&2
 		echo "if you want to test the partition directly, run:" >&2
-		echo "  DEMO_MODE=raw TARGET_DEVICE=/dev/sdX1 ACK_RAW_DEVICE=I_UNDERSTAND_THE_RISK ./scripts/smoke_v7_0_usb_demo.sh" >&2
+		echo "  DEMO_MODE=raw TARGET_DEVICE=/dev/sdX1 ACK_RAW_DEVICE=I_UNDERSTAND_THE_RISK $ENTRY_SCRIPT" >&2
+		echo "  whole-disk mode also requires: ALLOW_WHOLE_DISK=YES" >&2
 		exit 2
 	fi
 	rm -f "$IMG_PATH"
@@ -151,11 +184,10 @@ if [ "$DEMO_MODE" = "image" ]; then
 	TARGET_FS=$IMG_PATH
 elif [ "$DEMO_MODE" = "raw" ]; then
 	if [ -z "$TARGET_DEVICE" ]; then
-		echo "raw-device mode requires TARGET_DEVICE=/dev/sdX1" >&2
+		echo "raw-device mode requires TARGET_DEVICE=/dev/sdX1 (or /dev/sdX with ALLOW_WHOLE_DISK=YES)" >&2
 		exit 2
 	fi
 	require_raw_partition
-	check_raw_device_size
 	if findmnt -rn -S "$TARGET_DEVICE" >/dev/null 2>&1; then
 		sudo umount "$TARGET_DEVICE"
 	fi
@@ -174,6 +206,8 @@ log_step "mkfs"
 run_mkfs
 log_step "fsck after mkfs"
 run_fsck
+log_step "inspect gdt after mkfs"
+verify_gdt_layout
 
 log_step "prepare large source file"
 dd if=/dev/urandom of="$LARGE_SRC" bs=1M count="$LARGE_MB"
@@ -190,7 +224,7 @@ sudo mkdir "$MNT/demo"
 log_step "mkdir demo/diridx"
 sudo mkdir "$MNT/demo/diridx"
 log_step "write demo info"
-printf 'v7.0 usb demo\n' | sudo tee "$MNT/demo/info.txt" >/dev/null
+printf '%s\n' "$DEMO_TEXT" | sudo tee "$MNT/demo/info.txt" >/dev/null
 log_step "rename demo info"
 sudo mv "$MNT/demo/info.txt" "$MNT/demo/info-renamed.txt"
 log_step "create hardlink"
@@ -198,7 +232,7 @@ sudo ln "$MNT/demo/info-renamed.txt" "$MNT/demo/info.hard"
 log_step "create symlink"
 sudo ln -s info-renamed.txt "$MNT/demo/info.soft"
 log_step "write demo note"
-printf 'note=v7.0-demo\n' | sudo tee "$MNT/demo/.demo-note" >/dev/null
+printf 'note=%s-demo\n' "$SCRIPT_TAG" | sudo tee "$MNT/demo/.demo-note" >/dev/null
 log_step "set xattr"
 sudo python3 - "$MNT/demo/info-renamed.txt" <<'PY'
 import os
@@ -232,7 +266,7 @@ PY
 test "$(readlink "$MNT/demo/info.soft")" = "info-renamed.txt"
 test "$(stat -c %h "$MNT/demo/info.hard")" = "2"
 test -f "$MNT/demo/info-renamed.txt"
-test "$(sudo cat "$MNT/demo/info.soft")" = "v7.0 usb demo"
+test "$(sudo cat "$MNT/demo/info.soft")" = "$DEMO_TEXT"
 
 log_step "sync and unmount first mount"
 sudo sync
@@ -244,7 +278,7 @@ run_fsck
 
 if [ -n "$KEY" ] && [ "$DEMO_MODE" = "image" ]; then
 	log_step "verify encrypted image is not plaintext"
-	if grep -a -q "v7.0 usb demo" "$TARGET_FS"; then
+	if grep -a -q "$DEMO_TEXT" "$TARGET_FS"; then
 		echo "plaintext found in encrypted image" >&2
 		exit 1
 	fi
@@ -268,7 +302,7 @@ PY
 test "$(readlink "$MNT/demo/info.soft")" = "info-renamed.txt"
 test -f "$MNT/demo/diridx/file_1.txt"
 test -f "$MNT/demo/diridx/file_$DIR_FILE_COUNT.txt"
-test "$(sudo cat "$MNT/demo/info.soft")" = "v7.0 usb demo"
+test "$(sudo cat "$MNT/demo/info.soft")" = "$DEMO_TEXT"
 
 log_step "sync and unmount second mount"
 sudo sync
@@ -277,6 +311,8 @@ sudo rmmod cryexts
 
 log_step "fsck after second unmount"
 run_fsck
+log_step "inspect gdt after second fsck"
+verify_gdt_layout
 
 trap - EXIT
-echo "v7.0 usb demo smoke test passed"
+echo "$SCRIPT_TAG usb demo smoke test passed"

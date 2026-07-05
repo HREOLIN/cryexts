@@ -2521,18 +2521,19 @@ static int repair_recovery_state(int fd, unsigned char *super_block,
 int main(int argc, char **argv)
 {
 	unsigned char block[CRYEXTS_BLOCK_SIZE];
-	unsigned char gdt_block[CRYEXTS_BLOCK_SIZE];
 	unsigned char journal_header_block[CRYEXTS_BLOCK_SIZE];
 	unsigned char policy_table_block[CRYEXTS_BLOCK_SIZE];
 	struct cryexts_super_block *sb;
 	struct cryexts_group_desc *groups = NULL;
 	struct cryexts_policy_table_block *policy_table = NULL;
+	unsigned char *gdt_region = NULL;
 	unsigned char inode_bitmap[CRYEXTS_BLOCK_SIZE];
 	unsigned char block_bitmap[CRYEXTS_BLOCK_SIZE];
 	unsigned char *inode_seen = NULL;
 	unsigned char *block_seen = NULL;
 	uint64_t blocks_count;
 	uint64_t inodes_count;
+	uint64_t gdt_bytes;
 	int fd;
 	int argi = 1;
 
@@ -2568,18 +2569,22 @@ int main(int argc, char **argv)
 	if (errors)
 		goto out;
 	if (has_block_groups(sb)) {
-		if (le64toh(sb->group_desc_table_blocks) > 1) {
-			report("multi-block GDT is not yet supported by cryextsck");
+		gdt_bytes = le64toh(sb->group_desc_table_blocks) *
+			    CRYEXTS_BLOCK_SIZE;
+		gdt_region = calloc(gdt_bytes ? gdt_bytes : 1, 1);
+		if (!gdt_region) {
+			perror("calloc");
+			errors++;
 			goto out;
 		}
-		if (read_full(fd, gdt_block, sizeof(gdt_block),
+		if (read_full(fd, gdt_region, gdt_bytes,
 			      le64toh(sb->group_desc_table_start) *
 				      CRYEXTS_BLOCK_SIZE) < 0) {
 			perror("read group descriptor table");
 			errors++;
 			goto out;
 		}
-		groups = (struct cryexts_group_desc *)gdt_block;
+		groups = (struct cryexts_group_desc *)gdt_region;
 		validate_groups(sb, groups);
 		if (errors)
 			goto out;
@@ -2669,6 +2674,7 @@ int main(int argc, char **argv)
 	}
 
 out:
+	free(gdt_region);
 	free(inode_seen);
 	free(block_seen);
 	close(fd);
