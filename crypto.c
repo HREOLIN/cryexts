@@ -183,7 +183,8 @@ static int cryexts_init_crypto_transform(struct cryexts_sb_info *sbi)
 	if (sbi->encryption_alg != CRYEXTS_ALG_AES_CTR)
 		return -EINVAL;
 
-	sbi->skcipher = crypto_alloc_skcipher("ctr(aes)", 0, 0);
+	sbi->skcipher = crypto_alloc_skcipher("ctr(aes)", 0,
+					     CRYPTO_ALG_ASYNC);
 	if (IS_ERR(sbi->skcipher)) {
 		err = PTR_ERR(sbi->skcipher);
 		sbi->skcipher = NULL;
@@ -207,7 +208,8 @@ static int cryexts_init_policy_transform(struct cryexts_policy_runtime *policy)
 {
 	int err;
 
-	policy->skcipher = crypto_alloc_skcipher("ctr(aes)", 0, 0);
+	policy->skcipher = crypto_alloc_skcipher("ctr(aes)", 0,
+						CRYPTO_ALG_ASYNC);
 	if (IS_ERR(policy->skcipher)) {
 		err = PTR_ERR(policy->skcipher);
 		policy->skcipher = NULL;
@@ -388,19 +390,22 @@ out_free:
 	return err;
 }
 
-void cryexts_crypt_buffer(struct cryexts_sb_info *sbi, void *buf,
-			  size_t len, u64 block, u64 pos)
+int cryexts_crypt_buffer(struct cryexts_sb_info *sbi, void *buf,
+			 size_t len, u64 block, u64 pos)
 {
 	int err;
 
-	if (!sbi->encrypted || !sbi->derived_key_len)
-		return;
+	if (!sbi->encrypted)
+		return 0;
+	if (!sbi->derived_key_len)
+		return -EACCES;
 	if (sbi->encryption_alg != CRYEXTS_ALG_AES_CTR || !sbi->skcipher)
-		return;
+		return -EUCLEAN;
 	err = cryexts_crypt_buffer_with_tfm(sbi->skcipher, sbi->salt, buf, len,
 					 block, pos);
 	if (err)
 		pr_err("cryexts: crypto transform failed (%d)\n", err);
+	return err;
 }
 
 int cryexts_read_file_block(struct super_block *sb, u64 block, void *buf)
@@ -411,7 +416,6 @@ int cryexts_read_file_block(struct super_block *sb, u64 block, void *buf)
 		return -EIO;
 	memcpy(buf, bh->b_data, CRYEXTS_BLOCK_SIZE);
 	brelse(bh);
-	cryexts_crypt_buffer(CRYEXTS_SB(sb), buf, CRYEXTS_BLOCK_SIZE, block, 0);
 	return 0;
 }
 
@@ -424,8 +428,6 @@ int cryexts_write_file_block(struct super_block *sb, u64 block,
 		return -EIO;
 	lock_buffer(bh);
 	memcpy(bh->b_data, buf, CRYEXTS_BLOCK_SIZE);
-	cryexts_crypt_buffer(CRYEXTS_SB(sb), bh->b_data, CRYEXTS_BLOCK_SIZE,
-			     block, 0);
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
@@ -440,71 +442,67 @@ static bool cryexts_policy_io_enabled(struct inode *inode)
 	       (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode));
 }
 
-int cryexts_read_inode_block(struct inode *inode, u64 block, void *buf)
+static int cryexts_crypt_inode_buffer(struct inode *inode, u64 block,
+				       void *buf)
 {
 	struct cryexts_sb_info *sbi = CRYEXTS_SB(inode->i_sb);
 	struct cryexts_policy_runtime *policy;
+
+	if (!cryexts_policy_io_enabled(inode))
+		return cryexts_crypt_buffer(sbi, buf, CRYEXTS_BLOCK_SIZE,
+					    block, 0);
+
+	policy = cryexts_find_policy(sbi, cryexts_inode_policy_id(inode));
+	if (!policy || !policy->skcipher)
+		return -EUCLEAN;
+	return cryexts_crypt_buffer_with_tfm(policy->skcipher, sbi->salt, buf,
+					     CRYEXTS_BLOCK_SIZE, block, 0);
+}
+
+int cryexts_read_inode_block(struct inode *inode, u64 block, void *buf)
+{
 	struct buffer_head *bh;
-	int err;
 
 	bh = sb_bread(inode->i_sb, block);
 	if (!bh)
 		return -EIO;
 	memcpy(buf, bh->b_data, CRYEXTS_BLOCK_SIZE);
 	brelse(bh);
-
-	if (!cryexts_policy_io_enabled(inode)) {
-		cryexts_crypt_buffer(sbi, buf, CRYEXTS_BLOCK_SIZE, block, 0);
-		return 0;
-	}
-
-	policy = cryexts_find_policy(sbi, cryexts_inode_policy_id(inode));
-	if (!policy || !policy->skcipher)
-		return -EUCLEAN;
-
-	err = cryexts_crypt_buffer_with_tfm(policy->skcipher, sbi->salt, buf,
-					     CRYEXTS_BLOCK_SIZE, block, 0);
-	if (err)
-		return err;
-	return 0;
+	return cryexts_crypt_inode_buffer(inode, block, buf);
 }
 
 int cryexts_write_inode_block(struct inode *inode, u64 block, const void *buf)
 {
 	struct cryexts_sb_info *sbi = CRYEXTS_SB(inode->i_sb);
-	struct cryexts_policy_runtime *policy;
 	struct buffer_head *bh;
+	const void *write_buf = buf;
+	void *encrypted_buf = NULL;
 	int err;
 
-	bh = sb_getblk(inode->i_sb, block);
-	if (!bh)
-		return -EIO;
-
-	lock_buffer(bh);
-	memcpy(bh->b_data, buf, CRYEXTS_BLOCK_SIZE);
-
-	if (!cryexts_policy_io_enabled(inode)) {
-		cryexts_crypt_buffer(sbi, bh->b_data, CRYEXTS_BLOCK_SIZE, block, 0);
-	} else {
-		policy = cryexts_find_policy(sbi, cryexts_inode_policy_id(inode));
-		if (!policy || !policy->skcipher) {
-			unlock_buffer(bh);
-			brelse(bh);
-			return -EUCLEAN;
-		}
-		err = cryexts_crypt_buffer_with_tfm(policy->skcipher, sbi->salt,
-						    bh->b_data, CRYEXTS_BLOCK_SIZE,
-						    block, 0);
+	if (sbi->encrypted) {
+		encrypted_buf = kmemdup(buf, CRYEXTS_BLOCK_SIZE, GFP_NOFS);
+		if (!encrypted_buf)
+			return -ENOMEM;
+		err = cryexts_crypt_inode_buffer(inode, block, encrypted_buf);
 		if (err) {
-			unlock_buffer(bh);
-			brelse(bh);
+			kfree_sensitive(encrypted_buf);
 			return err;
 		}
+		write_buf = encrypted_buf;
 	}
 
+	bh = sb_getblk(inode->i_sb, block);
+	if (!bh) {
+		kfree_sensitive(encrypted_buf);
+		return -EIO;
+	}
+
+	lock_buffer(bh);
+	memcpy(bh->b_data, write_buf, CRYEXTS_BLOCK_SIZE);
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
 	brelse(bh);
+	kfree_sensitive(encrypted_buf);
 	return 0;
 }

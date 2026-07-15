@@ -199,8 +199,8 @@ bool cryexts_policy_table_enabled(struct super_block *sb);
 int cryexts_load_policy_table(struct super_block *sb);
 void cryexts_unload_policy_table(struct cryexts_sb_info *sbi);
 bool cryexts_policy_exists(struct super_block *sb, u32 policy_id);
-void cryexts_crypt_buffer(struct cryexts_sb_info *sbi, void *buf,
-			  size_t len, u64 block, u64 pos);
+int cryexts_crypt_buffer(struct cryexts_sb_info *sbi, void *buf,
+			 size_t len, u64 block, u64 pos);
 int cryexts_read_file_block(struct super_block *sb, u64 block, void *buf);
 int cryexts_write_file_block(struct super_block *sb, u64 block,
 			     const void *buf);
@@ -264,6 +264,7 @@ extern const struct xattr_handler *cryexts_xattr_handlers[];
 
 extern const struct file_operations cryexts_dir_operations;
 extern const struct file_operations cryexts_file_operations;
+extern const struct address_space_operations cryexts_file_aops;
 extern const struct inode_operations cryexts_dir_inode_operations;
 extern const struct inode_operations cryexts_file_inode_operations;
 extern const struct inode_operations cryexts_symlink_inode_operations;

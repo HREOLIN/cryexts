@@ -2354,6 +2354,7 @@ static int cryexts_init_vfs_inode(struct inode *inode,
 	} else if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &cryexts_file_inode_operations;
 		inode->i_fop = &cryexts_file_operations;
+		inode->i_mapping->a_ops = &cryexts_file_aops;
 	} else if (S_ISLNK(inode->i_mode)) {
 		inode->i_op = &cryexts_symlink_inode_operations;
 		inode_nohighmem(inode);
@@ -2506,6 +2507,7 @@ struct inode *cryexts_new_inode(struct inode *dir, umode_t mode,
 	} else if (S_ISREG(mode)) {
 		inode->i_op = &cryexts_file_inode_operations;
 		inode->i_fop = &cryexts_file_operations;
+		inode->i_mapping->a_ops = &cryexts_file_aops;
 	} else if (S_ISLNK(mode)) {
 		inode->i_op = &cryexts_symlink_inode_operations;
 		inode_nohighmem(inode);
@@ -2539,6 +2541,7 @@ int cryexts_release_inode_storage(struct inode *inode)
 	if (!cryexts_inode_blocks(inode))
 		return 0;
 
+	truncate_inode_pages(inode->i_mapping, 0);
 	err = cryexts_free_blocks_from(inode, 0);
 	if (err)
 		return err;

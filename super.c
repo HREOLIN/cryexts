@@ -631,7 +631,8 @@ static int cryexts_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_magic = CRYEXTS_MAGIC;
 	sb->s_op = &cryexts_super_ops;
 	sb->s_xattr = cryexts_xattr_handlers;
-	sb->s_maxbytes = cryexts_regular_file_max_size();
+	sb->s_maxbytes = (loff_t)CRYEXTS_EXTENT_TREE_V2_FILE_BLOCKS_MAX *
+			 CRYEXTS_BLOCK_SIZE;
 	sb->s_time_gran = 1;
 
 	root_inode = cryexts_iget(sb, CRYEXTS_ROOT_INO);

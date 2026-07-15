@@ -369,6 +369,68 @@ Expected result for V6.5: create, unlink, rename, and hard-link operations keep
 the directory index masks and entry count consistent, remount lookup still
 works, and `cryextsck` reports a clean image.
 
+## Version 10.0 Performance Baseline Smoke Test
+
+Version 10.0 does not change the regular-file I/O path yet. It freezes a
+repeatable benchmark baseline so later page-cache and buffered-write work can
+be measured against one fixed reference.
+
+```bash
+chmod +x scripts/smoke_v10_0_performance_baseline.sh
+./scripts/smoke_v10_0_performance_baseline.sh
+```
+
+Expected result for V10.0: the script builds and mounts CRYEXTS, reports
+baseline numbers for sequential write/read, small-file create/unlink, and
+directory scan, then unmounts cleanly and `cryextsck` still reports a clean
+filesystem.
+
+## Version 10.1 Cached-Read Smoke Test
+
+Version 10.1 moves regular-file reads onto the Linux page-cache path while
+keeping the old direct-write path temporarily coherent by invalidating cached
+pages after overwrites.
+
+```bash
+chmod +x scripts/smoke_v10_1_cached_read.sh
+./scripts/smoke_v10_1_cached_read.sh
+```
+
+Expected result for V10.1: repeated reads of the same file stay correct,
+overwriting a cached file does not return stale data on the next read, remount
+still works, and `cryextsck` reports a clean filesystem after the smoke.
+
+## Version 10.2 Page-Cache Write Baseline Smoke Test
+
+Version 10.2 moves regular-file writes onto the Linux
+`generic_file_write_iter` plus `write_begin/write_end` path. This stage uses
+synchronous write-through; dirty-page aggregation and asynchronous writeback
+remain scoped to Version 10.3.
+
+```bash
+chmod +x scripts/smoke_v10_2_buffered_write.sh
+./scripts/smoke_v10_2_buffered_write.sh
+```
+
+Expected result for V10.2: small writes, unaligned overwrite, append, truncate,
+and remount persistence all preserve exact file contents, and `cryextsck`
+reports a clean filesystem after the smoke.
+
+## Version 10.3 Writeback Smoke Test
+
+Version 10.3 changes `write_end` to leave dirty page-cache pages and adds
+`writepage/writepages` for delayed block allocation, encrypted data write,
+inode persistence, and per-page journal commit.
+
+```bash
+chmod +x scripts/smoke_v10_3_writeback.sh
+./scripts/smoke_v10_3_writeback.sh
+```
+
+Expected result for V10.3: dirty small writes are readable before fsync,
+`fsync` and `sync` persist exact contents across remount, unlinking a dirty
+file does not resurrect it, and `cryextsck` reports a clean filesystem.
+
 ## Current Scope
 
 Implemented:

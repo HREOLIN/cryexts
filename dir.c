@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "cryexts.h"
+#include <linux/pagemap.h>
 
 static int cryexts_validate_dirent(struct super_block *sb,
 				   struct cryexts_dir_entry *de,
@@ -1101,6 +1102,12 @@ static int cryexts_unlink(struct inode *dir, struct dentry *dentry)
 	struct inode *inode = d_inode(dentry);
 	int err;
 
+	if (S_ISREG(inode->i_mode) && inode->i_nlink == 1) {
+		err = filemap_write_and_wait(inode->i_mapping);
+		if (err)
+			return err;
+	}
+
 	err = cryexts_journal_begin(dir->i_sb);
 	if (err)
 		return err;
@@ -1208,6 +1215,13 @@ static int cryexts_rename(struct user_namespace *mnt_userns,
 	bool victim_is_dir = false;
 	bool victim_dir_count_dropped = false;
 	int err;
+
+	if (new_inode && S_ISREG(new_inode->i_mode) &&
+	    new_inode->i_nlink == 1) {
+		err = filemap_write_and_wait(new_inode->i_mapping);
+		if (err)
+			return err;
+	}
 
 	err = cryexts_journal_begin(old_dir->i_sb);
 	if (err)
