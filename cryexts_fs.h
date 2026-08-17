@@ -59,6 +59,8 @@
 #define CRYEXTS_FEATURE_INCOMPAT_POLICY_TABLE 0x00000100U
 #define CRYEXTS_FEATURE_INCOMPAT_EXTENT_TREE 0x00000200U
 #define CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 0x00000400U
+#define CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3 0x00000800U
+#define CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING 0x00001000U
 #define CRYEXTS_FEATURE_RO_COMPAT_NONE 0x00000000U
 #define CRYEXTS_FEATURE_RO_COMPAT_METADATA_CSUM 0x00000001U
 #define CRYEXTS_FEATURE_RO_COMPAT_LARGE_XATTR 0x00000002U
@@ -79,6 +81,20 @@
 #define CRYEXTS_JOURNAL_V2_BLOCK_CONTROL 1U
 #define CRYEXTS_JOURNAL_V2_BLOCK_DESCRIPTOR 2U
 #define CRYEXTS_JOURNAL_V2_BLOCK_COMMIT 3U
+#define CRYEXTS_JOURNAL_V3_MIN_BLOCKS 4U
+#define CRYEXTS_JOURNAL_V3_MAGIC 0x4a4e4c33U /* "JNL3" */
+#define CRYEXTS_JOURNAL_V3_LAYOUT_VERSION 3U
+#define CRYEXTS_JOURNAL_V3_FEATURE_REDO 0x00000001U
+#define CRYEXTS_JOURNAL_V3_FEATURE_RING 0x00000002U
+#define CRYEXTS_JOURNAL_V3_STATE_IDLE 0U
+#define CRYEXTS_JOURNAL_V3_STATE_ACTIVE 1U
+#define CRYEXTS_JOURNAL_V3_STATE_PREPARED 2U
+#define CRYEXTS_JOURNAL_V3_STATE_COMMITTED 3U
+#define CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING 4U
+#define CRYEXTS_JOURNAL_V3_FLAG_COMMITTED 0x00000001U
+#define CRYEXTS_JOURNAL_V3_BLOCK_CONTROL 1U
+#define CRYEXTS_JOURNAL_V3_BLOCK_DESCRIPTOR 2U
+#define CRYEXTS_JOURNAL_V3_BLOCK_COMMIT 3U
 
 #define CRYEXTS_KDF_NONE 0U
 #define CRYEXTS_KDF_SALTED_FNV1A 1U
@@ -258,6 +274,70 @@ struct cryexts_journal_v2_commit {
 #define CRYEXTS_JOURNAL_V2_MAX_ENTRIES \
 	((CRYEXTS_BLOCK_SIZE - CRYEXTS_JOURNAL_V2_DESCRIPTOR_BYTES) / \
 	 sizeof(__le64))
+
+struct cryexts_journal_v3_control {
+	__le32 magic;
+	__le16 layout_version;
+	__le16 block_type;
+	__le32 state;
+	__le32 features;
+	__le32 checksum;
+	__le32 reserved0;
+	__le64 last_sequence;
+	__le64 active_sequence;
+	__le64 checkpoint_sequence;
+	__le64 descriptor_block;
+	__le64 payload_start;
+	__le64 payload_blocks;
+	__le64 commit_block;
+	__le64 ring_head;
+	__le64 ring_tail;
+	__le64 ring_start;
+	__le64 ring_end;
+	__u8 reserved[16];
+} __attribute__((packed));
+
+struct cryexts_journal_v3_entry {
+	__le64 home_block;
+	__le32 payload_checksum;
+	__le32 flags;
+} __attribute__((packed));
+
+struct cryexts_journal_v3_descriptor {
+	__le32 magic;
+	__le16 layout_version;
+	__le16 block_type;
+	__le32 flags;
+	__le32 entry_count;
+	__le32 checksum;
+	__le32 reserved0;
+	__le64 sequence;
+	__le64 payload_start;
+	__le64 commit_block;
+	__u8 reserved[24];
+	struct cryexts_journal_v3_entry entries[];
+} __attribute__((packed));
+
+struct cryexts_journal_v3_commit {
+	__le32 magic;
+	__le16 layout_version;
+	__le16 block_type;
+	__le32 flags;
+	__le32 entry_count;
+	__le32 checksum;
+	__le32 descriptor_checksum;
+	__le32 payload_checksum;
+	__le32 reserved0;
+	__le64 sequence;
+	__le64 descriptor_block;
+	__u8 reserved[24];
+} __attribute__((packed));
+
+#define CRYEXTS_JOURNAL_V3_DESCRIPTOR_BYTES 72U
+#define CRYEXTS_JOURNAL_V3_COMMIT_BYTES 72U
+#define CRYEXTS_JOURNAL_V3_MAX_ENTRIES \
+	((CRYEXTS_BLOCK_SIZE - CRYEXTS_JOURNAL_V3_DESCRIPTOR_BYTES) / \
+	 sizeof(struct cryexts_journal_v3_entry))
 
 struct cryexts_extent_header {
 	__le16 magic;

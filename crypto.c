@@ -506,3 +506,20 @@ int cryexts_write_inode_block(struct inode *inode, u64 block, const void *buf)
 	kfree_sensitive(encrypted_buf);
 	return 0;
 }
+
+int cryexts_sync_inode_block(struct inode *inode, u64 block)
+{
+	struct buffer_head *bh;
+	int err;
+
+	bh = sb_getblk(inode->i_sb, block);
+	if (!bh)
+		return -EIO;
+
+	/* ponytail: sync the exact data buffer; a global sync would hide ordering bugs. */
+	err = sync_dirty_buffer(bh);
+	if (!err && buffer_write_io_error(bh))
+		err = -EIO;
+	brelse(bh);
+	return err;
+}

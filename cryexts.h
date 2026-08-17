@@ -58,9 +58,13 @@ struct cryexts_sb_info {
 	u64 journal_active_sequence;
 	u64 journal_tail_sequence;
 	u64 journal_checkpoint_sequence;
+	u64 journal_ring_head;
+	u64 journal_ring_tail;
 	bool encrypted;
 	bool journal_enabled;
 	bool journal_v2;
+	bool journal_v3;
+	bool journal_ring;
 	bool journal_replaying;
 	u32 key_verifier;
 	u32 encryption_flags;
@@ -72,6 +76,7 @@ struct cryexts_sb_info {
 	struct cryexts_policy_runtime *policies;
 	u16 policy_count;
 	unsigned int journal_entry_count;
+	int journal_error;
 	u64 journal_home_blocks[CRYEXTS_JOURNAL_MAX_ENTRIES];
 	struct crypto_skcipher *skcipher;
 	struct mutex alloc_lock;
@@ -207,6 +212,7 @@ int cryexts_write_file_block(struct super_block *sb, u64 block,
 int cryexts_read_inode_block(struct inode *inode, u64 block, void *buf);
 int cryexts_write_inode_block(struct inode *inode, u64 block,
 			      const void *buf);
+int cryexts_sync_inode_block(struct inode *inode, u64 block);
 int cryexts_sync_metadata(struct super_block *sb);
 u32 cryexts_journal_checksum(const void *buf, size_t len);
 int cryexts_journal_begin(struct super_block *sb);

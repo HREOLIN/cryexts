@@ -17,6 +17,18 @@ static u32 cryexts_checksum_skip(const void *buf, size_t len,
 	return hash;
 }
 
+static u32 cryexts_fnv1a_update(u32 hash, const void *buf, size_t len)
+{
+	const u8 *bytes = buf;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
 u32 cryexts_journal_checksum(const void *buf, size_t len)
 {
 	return cryexts_checksum_skip(buf, len,
@@ -30,6 +42,19 @@ bool cryexts_journal_uses_v2(struct super_block *sb)
 
 	return sbi && sbi->journal_enabled && sbi->journal_v2;
 }
+
+static bool cryexts_journal_uses_v3(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+
+	return sbi && sbi->journal_enabled && sbi->journal_v3;
+}
+
+static u32 cryexts_journal_v3_features(struct cryexts_sb_info *sbi);
+static u64 cryexts_journal_v3_ring_start(struct cryexts_sb_info *sbi);
+static bool cryexts_journal_v3_ring_valid(
+	struct cryexts_sb_info *sbi,
+	const struct cryexts_journal_v3_control *control);
 
 static u32 cryexts_journal_v2_checksum(const void *buf, size_t len,
 				       size_t checksum_offset)
@@ -840,6 +865,176 @@ out:
 	return err;
 }
 
+static int cryexts_journal_v3_validate_clean(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	struct cryexts_journal_v3_control *control;
+	struct cryexts_journal_v3_descriptor *descriptor;
+	struct cryexts_journal_v3_commit *commit;
+	char *control_buf;
+	char *descriptor_buf;
+	char *commit_buf;
+	u64 descriptor_block = sbi->journal_block + 1;
+	u64 payload_start = sbi->journal_block + 2;
+	u64 payload_blocks = sbi->journal_blocks - 3;
+	u64 commit_block = sbi->journal_block + sbi->journal_blocks - 1;
+	u64 last_sequence;
+	u32 expected;
+	u32 state;
+	u32 i;
+	int err = -EUCLEAN;
+
+	control_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	descriptor_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	commit_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	if (!control_buf || !descriptor_buf || !commit_buf) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	err = cryexts_read_file_block(sb, sbi->journal_block, control_buf);
+	if (err)
+		goto out;
+	control = (struct cryexts_journal_v3_control *)control_buf;
+	if (sbi->journal_ring) {
+		if (le32_to_cpu(control->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+		    le16_to_cpu(control->layout_version) !=
+			    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+		    le16_to_cpu(control->block_type) !=
+			    CRYEXTS_JOURNAL_V3_BLOCK_CONTROL ||
+		    le32_to_cpu(control->features) !=
+			    cryexts_journal_v3_features(sbi))
+			goto corrupt;
+		err = cryexts_journal_v3_ring_valid(sbi, control) ? 0 : -EUCLEAN;
+		if (err)
+			goto out;
+		expected = cryexts_journal_v2_checksum(
+			control_buf, CRYEXTS_BLOCK_SIZE,
+			offsetof(struct cryexts_journal_v3_control, checksum));
+		if (le32_to_cpu(control->checksum) != expected)
+			goto corrupt;
+		state = le32_to_cpu(control->state);
+		if (state != CRYEXTS_JOURNAL_V3_STATE_IDLE ||
+		    le64_to_cpu(control->active_sequence) ||
+		    le64_to_cpu(control->checkpoint_sequence) !=
+			    le64_to_cpu(control->last_sequence))
+			goto corrupt;
+		sbi->journal_sequence = le64_to_cpu(control->last_sequence);
+		sbi->journal_last_sequence = sbi->journal_sequence;
+		sbi->journal_active_sequence = 0;
+		sbi->journal_tail_sequence = sbi->journal_sequence;
+		sbi->journal_checkpoint_sequence = sbi->journal_sequence;
+		sbi->journal_ring_head = le64_to_cpu(control->ring_head);
+		sbi->journal_ring_tail = le64_to_cpu(control->ring_tail);
+		err = 0;
+		goto out;
+	}
+	if (le32_to_cpu(control->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+	    le16_to_cpu(control->layout_version) !=
+		    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+	    le16_to_cpu(control->block_type) !=
+		    CRYEXTS_JOURNAL_V3_BLOCK_CONTROL ||
+	    le32_to_cpu(control->features) != cryexts_journal_v3_features(sbi) ||
+	    (!sbi->journal_ring &&
+	     (le64_to_cpu(control->descriptor_block) != descriptor_block ||
+	      le64_to_cpu(control->payload_start) != payload_start ||
+	      le64_to_cpu(control->payload_blocks) != payload_blocks ||
+	      le64_to_cpu(control->commit_block) != commit_block)))
+		goto corrupt;
+	if (!cryexts_journal_v3_ring_valid(sbi, control))
+		goto corrupt;
+	if (sbi->journal_ring) {
+		sbi->journal_ring_head = le64_to_cpu(control->ring_head);
+		sbi->journal_ring_tail = le64_to_cpu(control->ring_tail);
+		descriptor_block = le64_to_cpu(control->descriptor_block);
+		payload_start = le64_to_cpu(control->payload_start);
+		payload_blocks = le64_to_cpu(control->payload_blocks);
+		commit_block = le64_to_cpu(control->commit_block);
+	}
+	err = cryexts_read_file_block(sb, descriptor_block, descriptor_buf);
+	if (err)
+		goto out;
+	err = cryexts_read_file_block(sb, commit_block, commit_buf);
+	if (err)
+		goto out;
+	expected = cryexts_journal_v2_checksum(
+		control_buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_control, checksum));
+	if (le32_to_cpu(control->checksum) != expected)
+		goto corrupt;
+	state = le32_to_cpu(control->state);
+	if (state > CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING)
+		goto corrupt;
+	if (state != CRYEXTS_JOURNAL_V3_STATE_IDLE) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	descriptor =
+		(struct cryexts_journal_v3_descriptor *)descriptor_buf;
+	if (le32_to_cpu(descriptor->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+	    le16_to_cpu(descriptor->layout_version) !=
+		    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+	    le16_to_cpu(descriptor->block_type) !=
+		    CRYEXTS_JOURNAL_V3_BLOCK_DESCRIPTOR ||
+	    le32_to_cpu(descriptor->flags) ||
+	    le32_to_cpu(descriptor->entry_count) ||
+	    le64_to_cpu(descriptor->payload_start) != payload_start ||
+	    le64_to_cpu(descriptor->commit_block) != commit_block)
+		goto corrupt;
+	expected = cryexts_journal_v2_checksum(
+		descriptor_buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_descriptor, checksum));
+	if (le32_to_cpu(descriptor->checksum) != expected)
+		goto corrupt;
+	for (i = 0; i < CRYEXTS_JOURNAL_V3_MAX_ENTRIES; i++) {
+		if (le64_to_cpu(descriptor->entries[i].home_block) ||
+		    le32_to_cpu(descriptor->entries[i].payload_checksum) ||
+		    le32_to_cpu(descriptor->entries[i].flags))
+			goto corrupt;
+	}
+
+	commit = (struct cryexts_journal_v3_commit *)commit_buf;
+	if (le32_to_cpu(commit->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+	    le16_to_cpu(commit->layout_version) !=
+		    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+	    le16_to_cpu(commit->block_type) != CRYEXTS_JOURNAL_V3_BLOCK_COMMIT ||
+	    le32_to_cpu(commit->flags) || le32_to_cpu(commit->entry_count) ||
+	    le64_to_cpu(commit->descriptor_block) != descriptor_block ||
+	    le32_to_cpu(commit->descriptor_checksum) !=
+		    le32_to_cpu(descriptor->checksum) ||
+	    le32_to_cpu(commit->payload_checksum))
+		goto corrupt;
+	expected = cryexts_journal_v2_checksum(
+		commit_buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_commit, checksum));
+	if (le32_to_cpu(commit->checksum) != expected)
+		goto corrupt;
+
+	last_sequence = le64_to_cpu(control->last_sequence);
+	if (le64_to_cpu(control->active_sequence) ||
+	    le64_to_cpu(control->checkpoint_sequence) != last_sequence ||
+	    le64_to_cpu(descriptor->sequence) != last_sequence ||
+	    le64_to_cpu(commit->sequence) != last_sequence)
+		goto corrupt;
+	sbi->journal_sequence = last_sequence;
+	sbi->journal_last_sequence = last_sequence;
+	sbi->journal_active_sequence = 0;
+	sbi->journal_tail_sequence = last_sequence;
+	sbi->journal_checkpoint_sequence = last_sequence;
+	sbi->journal_ring_head = le64_to_cpu(control->ring_head);
+	sbi->journal_ring_tail = le64_to_cpu(control->ring_tail);
+	err = 0;
+	goto out;
+
+corrupt:
+	err = -EUCLEAN;
+out:
+	kfree(commit_buf);
+	kfree(descriptor_buf);
+	kfree(control_buf);
+	return err;
+}
+
 static void cryexts_orphan_update_cached_inode(struct super_block *sb,
 					       u64 ino, u64 next_orphan)
 {
@@ -1034,6 +1229,776 @@ int cryexts_orphan_cleanup(struct super_block *sb)
 	return err;
 }
 
+static u32 cryexts_journal_v3_payload_capacity(struct cryexts_sb_info *sbi)
+{
+	if (sbi->journal_blocks < CRYEXTS_JOURNAL_V3_MIN_BLOCKS)
+		return 0;
+	return min_t(u64, CRYEXTS_JOURNAL_V3_MAX_ENTRIES,
+		     sbi->journal_blocks - 3);
+}
+
+static u32 cryexts_journal_v3_features(struct cryexts_sb_info *sbi)
+{
+	return CRYEXTS_JOURNAL_V3_FEATURE_REDO |
+		(sbi->journal_ring ? CRYEXTS_JOURNAL_V3_FEATURE_RING : 0);
+}
+
+static u64 cryexts_journal_v3_ring_start(struct cryexts_sb_info *sbi)
+{
+	return sbi->journal_block + 1;
+}
+
+static u64 cryexts_journal_v3_ring_end(struct cryexts_sb_info *sbi)
+{
+	return sbi->journal_block + sbi->journal_blocks;
+}
+
+static bool cryexts_journal_v3_ring_valid(
+	struct cryexts_sb_info *sbi,
+	const struct cryexts_journal_v3_control *control)
+{
+	if (!sbi->journal_ring)
+		return !le64_to_cpu(control->ring_head) &&
+		       !le64_to_cpu(control->ring_tail) &&
+		       !le64_to_cpu(control->ring_start) &&
+		       !le64_to_cpu(control->ring_end);
+
+	return le64_to_cpu(control->ring_start) ==
+		       cryexts_journal_v3_ring_start(sbi) &&
+	       le64_to_cpu(control->ring_end) ==
+		       cryexts_journal_v3_ring_end(sbi) &&
+	       le64_to_cpu(control->ring_head) >=
+		       cryexts_journal_v3_ring_start(sbi) &&
+	       le64_to_cpu(control->ring_head) <
+		       cryexts_journal_v3_ring_end(sbi) &&
+	       le64_to_cpu(control->ring_tail) >=
+		       cryexts_journal_v3_ring_start(sbi) &&
+	       le64_to_cpu(control->ring_tail) <
+		       cryexts_journal_v3_ring_end(sbi) &&
+	       (le32_to_cpu(control->state) != CRYEXTS_JOURNAL_V3_STATE_IDLE ||
+		le64_to_cpu(control->ring_head) ==
+		le64_to_cpu(control->ring_tail));
+}
+
+static void cryexts_journal_v3_prepare_control(struct super_block *sb,
+					       char *buf, u32 state,
+				       u64 last_sequence,
+				       u64 active_sequence,
+				       u64 checkpoint_sequence,
+				       u64 descriptor_block, u64 payload_start,
+				       u64 payload_blocks, u64 commit_block)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	struct cryexts_journal_v3_control *control;
+
+	memset(buf, 0, CRYEXTS_BLOCK_SIZE);
+	control = (struct cryexts_journal_v3_control *)buf;
+	control->magic = cpu_to_le32(CRYEXTS_JOURNAL_V3_MAGIC);
+	control->layout_version = cpu_to_le16(CRYEXTS_JOURNAL_V3_LAYOUT_VERSION);
+	control->block_type = cpu_to_le16(CRYEXTS_JOURNAL_V3_BLOCK_CONTROL);
+	control->state = cpu_to_le32(state);
+	control->features = cpu_to_le32(cryexts_journal_v3_features(sbi));
+	control->last_sequence = cpu_to_le64(last_sequence);
+	control->active_sequence = cpu_to_le64(active_sequence);
+	control->checkpoint_sequence = cpu_to_le64(checkpoint_sequence);
+	control->descriptor_block = cpu_to_le64(descriptor_block);
+	control->payload_start = cpu_to_le64(payload_start);
+	control->payload_blocks = cpu_to_le64(payload_blocks);
+	control->commit_block = cpu_to_le64(commit_block);
+	if (sbi->journal_ring) {
+		control->ring_start = cpu_to_le64(
+			cryexts_journal_v3_ring_start(sbi));
+		control->ring_end = cpu_to_le64(
+			cryexts_journal_v3_ring_end(sbi));
+		control->ring_head = cpu_to_le64(sbi->journal_ring_head);
+		control->ring_tail = cpu_to_le64(sbi->journal_ring_tail);
+	}
+	control->checksum = cpu_to_le32(cryexts_journal_v2_checksum(
+		buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_control, checksum)));
+}
+
+static void cryexts_journal_v3_prepare_descriptor(struct super_block *sb,
+						  char *buf, u32 entries,
+						  u64 sequence,
+						  u64 payload_start,
+						  u64 commit_block)
+{
+	struct cryexts_journal_v3_descriptor *descriptor;
+
+	(void)sb;
+
+	memset(buf, 0, CRYEXTS_BLOCK_SIZE);
+	descriptor = (struct cryexts_journal_v3_descriptor *)buf;
+	descriptor->magic = cpu_to_le32(CRYEXTS_JOURNAL_V3_MAGIC);
+	descriptor->layout_version =
+		cpu_to_le16(CRYEXTS_JOURNAL_V3_LAYOUT_VERSION);
+	descriptor->block_type =
+		cpu_to_le16(CRYEXTS_JOURNAL_V3_BLOCK_DESCRIPTOR);
+	descriptor->entry_count = cpu_to_le32(entries);
+	descriptor->sequence = cpu_to_le64(sequence);
+	descriptor->payload_start = cpu_to_le64(payload_start);
+	descriptor->commit_block = cpu_to_le64(commit_block);
+}
+
+static void cryexts_journal_v3_finish_descriptor(char *buf)
+{
+	struct cryexts_journal_v3_descriptor *descriptor =
+		(struct cryexts_journal_v3_descriptor *)buf;
+
+	descriptor->checksum = cpu_to_le32(cryexts_journal_v2_checksum(
+		buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_descriptor, checksum)));
+}
+
+static void cryexts_journal_v3_prepare_commit(struct super_block *sb,
+					      char *buf, u32 entries,
+					      u64 sequence,
+					      u32 descriptor_checksum,
+					      u32 payload_checksum,
+					      bool committed, u64 descriptor_block)
+{
+	struct cryexts_journal_v3_commit *commit;
+
+	(void)sb;
+
+	memset(buf, 0, CRYEXTS_BLOCK_SIZE);
+	commit = (struct cryexts_journal_v3_commit *)buf;
+	commit->magic = cpu_to_le32(CRYEXTS_JOURNAL_V3_MAGIC);
+	commit->layout_version = cpu_to_le16(CRYEXTS_JOURNAL_V3_LAYOUT_VERSION);
+	commit->block_type = cpu_to_le16(CRYEXTS_JOURNAL_V3_BLOCK_COMMIT);
+	commit->flags = cpu_to_le32(committed ?
+		CRYEXTS_JOURNAL_V3_FLAG_COMMITTED : 0);
+	commit->entry_count = cpu_to_le32(entries);
+	commit->descriptor_checksum = cpu_to_le32(descriptor_checksum);
+	commit->payload_checksum = cpu_to_le32(payload_checksum);
+	commit->sequence = cpu_to_le64(sequence);
+	commit->descriptor_block = cpu_to_le64(descriptor_block);
+	commit->checksum = cpu_to_le32(cryexts_journal_v2_checksum(
+		buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_commit, checksum)));
+}
+
+static int cryexts_journal_v3_write_sync(struct super_block *sb, u64 block,
+					 const char *buf)
+{
+	int err;
+
+	err = cryexts_write_file_block(sb, block, buf);
+	if (err)
+		return err;
+	return cryexts_sync_single_block(sb, block);
+}
+
+static void cryexts_journal_v3_clear_runtime(struct cryexts_sb_info *sbi)
+{
+	sbi->journal_entry_count = 0;
+	sbi->journal_error = 0;
+	sbi->journal_active_sequence = 0;
+	memset(sbi->journal_home_blocks, 0, sizeof(sbi->journal_home_blocks));
+}
+
+static int cryexts_journal_v3_ring_allocate(struct cryexts_sb_info *sbi,
+					     u32 entries, u64 *descriptor_block,
+					     u64 *payload_start, u64 *commit_block,
+					     u64 *next_head)
+{
+	u64 start = sbi->journal_ring_head;
+	u64 end = cryexts_journal_v3_ring_end(sbi);
+	u64 needed = (u64)entries + 2;
+
+	if (!sbi->journal_ring) {
+		*descriptor_block = cryexts_journal_v2_descriptor_block(sbi);
+		*payload_start = cryexts_journal_v2_payload_start(sbi);
+		*commit_block = cryexts_journal_v2_commit_block(sbi);
+		*next_head = start;
+		return 0;
+	}
+	if (needed > end - cryexts_journal_v3_ring_start(sbi))
+		return -ENOSPC;
+	if (start + needed > end) {
+		if (start != sbi->journal_ring_tail)
+			return -ENOSPC;
+		start = cryexts_journal_v3_ring_start(sbi);
+	}
+	*descriptor_block = start;
+	*payload_start = start + 1;
+	*commit_block = *payload_start + entries;
+	*next_head = *commit_block + 1;
+	if (*next_head == end)
+		*next_head = cryexts_journal_v3_ring_start(sbi);
+	return 0;
+}
+
+static int cryexts_journal_v3_begin(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	int err = 0;
+
+	mutex_lock(&sbi->journal_lock);
+	if (sbi->journal_active_sequence) {
+		err = sbi->journal_error ? sbi->journal_error : -EUCLEAN;
+		mutex_unlock(&sbi->journal_lock);
+		return err;
+	}
+	if (!cryexts_journal_v3_payload_capacity(sbi)) {
+		mutex_unlock(&sbi->journal_lock);
+		return -EOPNOTSUPP;
+	}
+
+	cryexts_journal_v3_clear_runtime(sbi);
+	sbi->journal_active_sequence = sbi->journal_sequence + 1;
+	return 0;
+}
+
+static int cryexts_journal_v3_record_block(struct super_block *sb,
+					    u64 home_block)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	u32 capacity = cryexts_journal_v3_payload_capacity(sbi);
+	unsigned int i;
+	int err = 0;
+
+	if (!sbi->journal_active_sequence)
+		return -EINVAL;
+	if (sbi->journal_error)
+		return sbi->journal_error;
+	if (home_block >= cryexts_blocks_count(sb) ||
+	    cryexts_journal_block_is_internal(sbi, home_block)) {
+		err = -EINVAL;
+		goto out;
+	}
+	for (i = 0; i < sbi->journal_entry_count; i++) {
+		if (sbi->journal_home_blocks[i] == home_block)
+			return 0;
+	}
+	if (sbi->journal_entry_count >= capacity) {
+		err = -ENOSPC;
+		goto out;
+	}
+
+	sbi->journal_home_blocks[sbi->journal_entry_count++] = home_block;
+	return 0;
+
+out:
+	sbi->journal_error = err;
+	return err;
+}
+
+static int cryexts_journal_v3_commit(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	struct cryexts_journal_v3_descriptor *descriptor;
+	char *descriptor_buf = NULL;
+	char *state_buf = NULL;
+	char *payload_buf = NULL;
+	u64 previous_sequence = sbi->journal_sequence;
+	u64 sequence = sbi->journal_active_sequence;
+	u64 descriptor_block;
+	u64 payload_start;
+	u64 commit_block;
+	u64 next_head;
+	u64 previous_head = sbi->journal_ring_head;
+	u64 previous_tail = sbi->journal_ring_tail;
+	u32 entries;
+	u32 descriptor_checksum;
+	u32 payload_checksum = 2166136261u;
+	unsigned int i;
+	bool commit_attempted = false;
+	int err = sbi->journal_error;
+
+	if (err)
+		goto out;
+
+	sbi->disk_sb->journal_sequence = cpu_to_le64(sequence);
+	cryexts_gdt_prepare_write(sb);
+	cryexts_super_set_recovery(sb, true);
+	if (sbi->journal_error) {
+		err = sbi->journal_error;
+		goto out_clear_recovery;
+	}
+	entries = sbi->journal_entry_count;
+	err = cryexts_journal_v3_ring_allocate(sbi, entries, &descriptor_block,
+					       &payload_start, &commit_block,
+					       &next_head);
+	if (err)
+		goto out_clear_recovery;
+	if (sbi->journal_ring) {
+		sbi->journal_ring_head = next_head;
+		sbi->journal_ring_tail = descriptor_block;
+	}
+
+	descriptor_buf = kzalloc(CRYEXTS_BLOCK_SIZE, GFP_NOFS);
+	state_buf = kzalloc(CRYEXTS_BLOCK_SIZE, GFP_NOFS);
+	payload_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_NOFS);
+	if (!descriptor_buf || !state_buf || !payload_buf) {
+		err = -ENOMEM;
+		goto out_clear_recovery;
+	}
+
+	cryexts_journal_v3_prepare_descriptor(sb, descriptor_buf, entries,
+					       sequence, payload_start, commit_block);
+	descriptor = (struct cryexts_journal_v3_descriptor *)descriptor_buf;
+	for (i = 0; i < entries; i++) {
+		u64 home_block = sbi->journal_home_blocks[i];
+		u32 checksum;
+
+		err = cryexts_read_file_block(sb, home_block, payload_buf);
+		if (err)
+			goto out_clear_recovery;
+		checksum = cryexts_fnv1a_update(2166136261u, payload_buf,
+						 CRYEXTS_BLOCK_SIZE);
+		payload_checksum = cryexts_fnv1a_update(payload_checksum,
+							 payload_buf,
+							 CRYEXTS_BLOCK_SIZE);
+		descriptor->entries[i].home_block = cpu_to_le64(home_block);
+		descriptor->entries[i].payload_checksum = cpu_to_le32(checksum);
+		err = cryexts_journal_v3_write_sync(
+			sb, payload_start + i,
+			payload_buf);
+		if (err)
+			goto out_clear_recovery;
+	}
+	if (!entries)
+		payload_checksum = 0;
+
+	cryexts_journal_v3_finish_descriptor(descriptor_buf);
+	descriptor_checksum = le32_to_cpu(descriptor->checksum);
+	err = cryexts_journal_v3_write_sync(
+		sb, descriptor_block, descriptor_buf);
+	if (err)
+		goto out_clear_recovery;
+
+	cryexts_journal_v3_prepare_control(
+		sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_PREPARED,
+		previous_sequence, sequence, previous_sequence, descriptor_block,
+		payload_start, entries, commit_block);
+	err = cryexts_journal_v3_write_sync(sb, sbi->journal_block, state_buf);
+	if (err)
+		goto out_clear_recovery;
+
+	cryexts_journal_v3_prepare_commit(sb, state_buf, entries, sequence,
+					  descriptor_checksum,
+					  payload_checksum, true, descriptor_block);
+	commit_attempted = true;
+	err = cryexts_journal_v3_write_sync(
+		sb, commit_block, state_buf);
+	if (err)
+		goto out;
+
+	cryexts_journal_v3_prepare_control(
+		sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING,
+		sequence, sequence, previous_sequence, descriptor_block,
+		payload_start, entries, commit_block);
+	err = cryexts_journal_v3_write_sync(sb, sbi->journal_block, state_buf);
+	if (err)
+		goto out;
+
+	for (i = 0; i < entries; i++) {
+		u32 checksum;
+
+		err = cryexts_read_file_block(
+			sb, payload_start + i,
+			payload_buf);
+		if (err)
+			goto out;
+		checksum = cryexts_fnv1a_update(2166136261u, payload_buf,
+						 CRYEXTS_BLOCK_SIZE);
+		if (checksum != le32_to_cpu(
+			    descriptor->entries[i].payload_checksum)) {
+			err = -EUCLEAN;
+			goto out;
+		}
+		err = cryexts_journal_v3_write_sync(
+			sb, sbi->journal_home_blocks[i], payload_buf);
+		if (err)
+			goto out;
+	}
+
+	sbi->journal_replaying = true;
+	cryexts_super_set_recovery(sb, false);
+	sbi->journal_replaying = false;
+	err = cryexts_sync_single_block(sb, sbi->s_sbh->b_blocknr);
+	if (err)
+		goto out;
+
+	if (sbi->journal_ring) {
+		sbi->journal_ring_head = next_head;
+		sbi->journal_ring_tail = next_head;
+	} else {
+		cryexts_journal_v3_prepare_descriptor(sb, descriptor_buf, 0, sequence,
+						       payload_start, commit_block);
+		cryexts_journal_v3_finish_descriptor(descriptor_buf);
+		descriptor_checksum = le32_to_cpu(
+			((struct cryexts_journal_v3_descriptor *)descriptor_buf)->checksum);
+		err = cryexts_journal_v3_write_sync(sb, descriptor_block, descriptor_buf);
+		if (err)
+			goto out;
+		cryexts_journal_v3_prepare_commit(sb, state_buf, 0, sequence,
+						  descriptor_checksum, 0, false,
+						  descriptor_block);
+		err = cryexts_journal_v3_write_sync(sb, commit_block, state_buf);
+		if (err)
+			goto out;
+	}
+
+	cryexts_journal_v3_prepare_control(
+		sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_IDLE,
+		sequence, 0, sequence, descriptor_block, payload_start,
+		entries, commit_block);
+	err = cryexts_journal_v3_write_sync(sb, sbi->journal_block, state_buf);
+	if (err)
+		goto out;
+
+	sbi->journal_sequence = sequence;
+	sbi->journal_last_sequence = sequence;
+	sbi->journal_tail_sequence = sequence;
+	sbi->journal_checkpoint_sequence = sequence;
+	cryexts_journal_v3_clear_runtime(sbi);
+	goto out_unlock;
+
+out_clear_recovery:
+	if (sbi->journal_ring) {
+		sbi->journal_ring_head = previous_head;
+		sbi->journal_ring_tail = previous_tail;
+	}
+	sbi->disk_sb->journal_sequence = cpu_to_le64(previous_sequence);
+	sbi->journal_replaying = true;
+	cryexts_super_set_recovery(sb, false);
+	sbi->journal_replaying = false;
+out:
+	if (err) {
+		pr_err("cryexts: journal v3 commit failed seq=%llu (%d)\n",
+		       sequence, err);
+		if (commit_attempted)
+			sbi->journal_error = err;
+		else
+			cryexts_journal_v3_clear_runtime(sbi);
+	}
+out_unlock:
+	kfree(payload_buf);
+	kfree(state_buf);
+	kfree(descriptor_buf);
+	mutex_unlock(&sbi->journal_lock);
+	return err;
+}
+
+static void cryexts_journal_v3_abort(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+
+	cryexts_journal_v3_clear_runtime(sbi);
+	if (mutex_is_locked(&sbi->journal_lock))
+		mutex_unlock(&sbi->journal_lock);
+}
+
+static int cryexts_journal_v3_reset_disk(struct super_block *sb, u64 sequence,
+					 char *descriptor_buf, char *state_buf,
+					 u64 descriptor_block, u64 payload_start,
+					 u64 payload_blocks, u64 commit_block)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	u32 descriptor_checksum;
+	int err;
+
+	if (sbi->journal_ring) {
+		cryexts_journal_v3_prepare_control(
+			sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_IDLE,
+			sequence, 0, sequence, descriptor_block, payload_start,
+			payload_blocks, commit_block);
+		return cryexts_journal_v3_write_sync(sb, sbi->journal_block,
+						     state_buf);
+	}
+
+	cryexts_journal_v3_prepare_descriptor(
+		sb, descriptor_buf, 0, sequence,
+		cryexts_journal_v2_payload_start(sbi),
+		cryexts_journal_v2_commit_block(sbi));
+	cryexts_journal_v3_finish_descriptor(descriptor_buf);
+	descriptor_checksum = le32_to_cpu(
+		((struct cryexts_journal_v3_descriptor *)descriptor_buf)->checksum);
+	err = cryexts_journal_v3_write_sync(
+		sb, cryexts_journal_v2_descriptor_block(CRYEXTS_SB(sb)),
+		descriptor_buf);
+	if (err)
+		return err;
+
+	cryexts_journal_v3_prepare_commit(sb, state_buf, 0, sequence,
+					  descriptor_checksum, 0, false,
+					  cryexts_journal_v2_descriptor_block(sbi));
+	err = cryexts_journal_v3_write_sync(
+		sb, cryexts_journal_v2_commit_block(CRYEXTS_SB(sb)), state_buf);
+	if (err)
+		return err;
+
+	cryexts_journal_v3_prepare_control(
+		sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_IDLE,
+		sequence, 0, sequence,
+		cryexts_journal_v2_descriptor_block(sbi),
+		cryexts_journal_v2_payload_start(sbi),
+		cryexts_journal_v2_payload_area_blocks(sbi),
+		cryexts_journal_v2_commit_block(sbi));
+	return cryexts_journal_v3_write_sync(
+		sb, CRYEXTS_SB(sb)->journal_block, state_buf);
+}
+
+static int cryexts_journal_v3_replay(struct super_block *sb)
+{
+	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
+	struct cryexts_journal_v3_control *control;
+	struct cryexts_journal_v3_descriptor *descriptor;
+	struct cryexts_journal_v3_commit *commit;
+	char *control_buf = NULL;
+	char *descriptor_buf = NULL;
+	char *commit_buf = NULL;
+	char *payload_buf = NULL;
+	u64 descriptor_block = cryexts_journal_v2_descriptor_block(sbi);
+	u64 payload_start = cryexts_journal_v2_payload_start(sbi);
+	u64 payload_blocks = cryexts_journal_v2_payload_area_blocks(sbi);
+	u64 commit_block = cryexts_journal_v2_commit_block(sbi);
+	u64 last_sequence;
+	u64 active_sequence;
+	u64 checkpoint_sequence;
+	u32 state;
+	u32 entries;
+	u32 aggregate_checksum = 2166136261u;
+	u32 expected;
+	u32 commit_flags;
+	unsigned int i;
+	int err = -EUCLEAN;
+	bool commit_valid;
+
+	control_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	descriptor_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	commit_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	payload_buf = kmalloc(CRYEXTS_BLOCK_SIZE, GFP_KERNEL);
+	if (!control_buf || !descriptor_buf || !commit_buf || !payload_buf) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	err = cryexts_read_file_block(sb, sbi->journal_block, control_buf);
+	if (err)
+		goto out;
+	control = (struct cryexts_journal_v3_control *)control_buf;
+	if (le32_to_cpu(control->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+	    le16_to_cpu(control->layout_version) !=
+		    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+	    le16_to_cpu(control->block_type) !=
+		    CRYEXTS_JOURNAL_V3_BLOCK_CONTROL ||
+	    le32_to_cpu(control->features) != cryexts_journal_v3_features(sbi) ||
+	    (!sbi->journal_ring &&
+	     (le64_to_cpu(control->descriptor_block) != descriptor_block ||
+	      le64_to_cpu(control->payload_start) != payload_start ||
+	      le64_to_cpu(control->payload_blocks) != payload_blocks ||
+	      le64_to_cpu(control->commit_block) != commit_block)))
+		goto corrupt;
+	if (!cryexts_journal_v3_ring_valid(sbi, control))
+		goto corrupt;
+	if (sbi->journal_ring) {
+		sbi->journal_ring_head = le64_to_cpu(control->ring_head);
+		sbi->journal_ring_tail = le64_to_cpu(control->ring_tail);
+		descriptor_block = le64_to_cpu(control->descriptor_block);
+		payload_start = le64_to_cpu(control->payload_start);
+		payload_blocks = le64_to_cpu(control->payload_blocks);
+		commit_block = le64_to_cpu(control->commit_block);
+	}
+	expected = cryexts_journal_v2_checksum(
+		control_buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_control, checksum));
+	if (le32_to_cpu(control->checksum) != expected)
+		goto corrupt;
+
+	state = le32_to_cpu(control->state);
+	if (state == CRYEXTS_JOURNAL_V3_STATE_IDLE) {
+		if (!cryexts_journal_needs_recovery(sb)) {
+			err = cryexts_journal_v3_validate_clean(sb);
+			goto out;
+		}
+		last_sequence = le64_to_cpu(control->last_sequence);
+		if (le64_to_cpu(control->active_sequence) ||
+		    le64_to_cpu(control->checkpoint_sequence) != last_sequence)
+			goto corrupt;
+		goto discard;
+	}
+	if (state > CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING)
+		goto corrupt;
+
+	last_sequence = le64_to_cpu(control->last_sequence);
+	active_sequence = le64_to_cpu(control->active_sequence);
+	checkpoint_sequence = le64_to_cpu(control->checkpoint_sequence);
+	if (!active_sequence || checkpoint_sequence > last_sequence)
+		goto corrupt;
+	if (state == CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING) {
+		if (active_sequence != last_sequence)
+			goto corrupt;
+	} else if (active_sequence != last_sequence + 1) {
+		goto corrupt;
+	}
+	if (state == CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING &&
+	    !cryexts_journal_needs_recovery(sb))
+		goto discard;
+
+	if (state == CRYEXTS_JOURNAL_V3_STATE_ACTIVE)
+		goto discard;
+
+	err = cryexts_read_file_block(sb, descriptor_block, descriptor_buf);
+	if (err)
+		goto out;
+	err = cryexts_read_file_block(sb, commit_block, commit_buf);
+	if (err)
+		goto out;
+
+	descriptor = (struct cryexts_journal_v3_descriptor *)descriptor_buf;
+	if (le32_to_cpu(descriptor->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+	    le16_to_cpu(descriptor->layout_version) !=
+		    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+	    le16_to_cpu(descriptor->block_type) !=
+		    CRYEXTS_JOURNAL_V3_BLOCK_DESCRIPTOR ||
+	    le32_to_cpu(descriptor->flags) ||
+	    le64_to_cpu(descriptor->sequence) != active_sequence ||
+	    le64_to_cpu(descriptor->payload_start) != payload_start ||
+	    le64_to_cpu(descriptor->commit_block) != commit_block)
+		goto corrupt;
+	entries = le32_to_cpu(descriptor->entry_count);
+	if (entries > cryexts_journal_v3_payload_capacity(sbi))
+		goto corrupt;
+	expected = cryexts_journal_v2_checksum(
+		descriptor_buf, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_descriptor, checksum));
+	if (le32_to_cpu(descriptor->checksum) != expected)
+		goto corrupt;
+	for (i = entries; i < CRYEXTS_JOURNAL_V3_MAX_ENTRIES; i++) {
+		if (le64_to_cpu(descriptor->entries[i].home_block) ||
+		    le32_to_cpu(descriptor->entries[i].payload_checksum) ||
+		    le32_to_cpu(descriptor->entries[i].flags))
+			goto corrupt;
+	}
+
+	commit = (struct cryexts_journal_v3_commit *)commit_buf;
+	commit_valid =
+		le32_to_cpu(commit->magic) == CRYEXTS_JOURNAL_V3_MAGIC &&
+		le16_to_cpu(commit->layout_version) ==
+			CRYEXTS_JOURNAL_V3_LAYOUT_VERSION &&
+		le16_to_cpu(commit->block_type) ==
+			CRYEXTS_JOURNAL_V3_BLOCK_COMMIT &&
+		le64_to_cpu(commit->descriptor_block) == descriptor_block;
+	if (commit_valid) {
+		expected = cryexts_journal_v2_checksum(
+			commit_buf, CRYEXTS_BLOCK_SIZE,
+			offsetof(struct cryexts_journal_v3_commit, checksum));
+		commit_valid = le32_to_cpu(commit->checksum) == expected;
+	}
+	if (!commit_valid) {
+		if (state == CRYEXTS_JOURNAL_V3_STATE_PREPARED)
+			goto discard;
+		goto corrupt;
+	}
+
+	commit_flags = le32_to_cpu(commit->flags);
+	if (!commit_flags) {
+		if (state == CRYEXTS_JOURNAL_V3_STATE_PREPARED)
+			goto discard;
+		goto corrupt;
+	}
+	if (commit_flags != CRYEXTS_JOURNAL_V3_FLAG_COMMITTED ||
+	    le32_to_cpu(commit->entry_count) != entries ||
+	    le64_to_cpu(commit->sequence) != active_sequence ||
+	    le32_to_cpu(commit->descriptor_checksum) !=
+		    le32_to_cpu(descriptor->checksum))
+		goto corrupt;
+
+	/* Validate every payload before modifying any home block. */
+	for (i = 0; i < entries; i++) {
+		u64 home_block =
+			le64_to_cpu(descriptor->entries[i].home_block);
+		unsigned int j;
+
+		if (home_block >= cryexts_blocks_count(sb) ||
+		    cryexts_journal_block_is_internal(sbi, home_block) ||
+		    le32_to_cpu(descriptor->entries[i].flags))
+			goto corrupt;
+		for (j = 0; j < i; j++) {
+			if (le64_to_cpu(descriptor->entries[j].home_block) ==
+			    home_block)
+				goto corrupt;
+		}
+		err = cryexts_read_file_block(sb, payload_start + i, payload_buf);
+		if (err)
+			goto out;
+		expected = cryexts_fnv1a_update(2166136261u, payload_buf,
+					       CRYEXTS_BLOCK_SIZE);
+		if (le32_to_cpu(descriptor->entries[i].payload_checksum) !=
+		    expected)
+			goto corrupt;
+		aggregate_checksum = cryexts_fnv1a_update(
+			aggregate_checksum, payload_buf, CRYEXTS_BLOCK_SIZE);
+	}
+	if (!entries)
+		aggregate_checksum = 0;
+	if (le32_to_cpu(commit->payload_checksum) != aggregate_checksum)
+		goto corrupt;
+
+	cryexts_journal_v3_prepare_control(
+		sb, control_buf, CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING,
+		active_sequence, active_sequence, checkpoint_sequence,
+		descriptor_block, payload_start, entries, commit_block);
+	err = cryexts_journal_v3_write_sync(sb, sbi->journal_block,
+					    control_buf);
+	if (err)
+		goto out;
+
+	sbi->journal_replaying = true;
+	for (i = 0; i < entries; i++) {
+		err = cryexts_read_file_block(sb, payload_start + i, payload_buf);
+		if (err)
+			break;
+		err = cryexts_journal_v3_write_sync(
+			sb, le64_to_cpu(descriptor->entries[i].home_block),
+			payload_buf);
+		if (err)
+			break;
+	}
+	sbi->journal_replaying = false;
+	if (err)
+		goto out;
+	last_sequence = active_sequence;
+
+discard:
+	sbi->journal_sequence = last_sequence;
+	sbi->journal_last_sequence = last_sequence;
+	sbi->journal_tail_sequence = last_sequence;
+	sbi->journal_checkpoint_sequence = last_sequence;
+	if (sbi->journal_ring) {
+		sbi->journal_ring_tail = le64_to_cpu(control->ring_head);
+		sbi->journal_ring_head = le64_to_cpu(control->ring_head);
+	}
+	sbi->disk_sb->journal_sequence = cpu_to_le64(last_sequence);
+	sbi->journal_replaying = true;
+	cryexts_super_set_recovery(sb, false);
+	sbi->journal_replaying = false;
+	err = cryexts_sync_single_block(sb, sbi->s_sbh->b_blocknr);
+	if (err)
+		goto out;
+	err = cryexts_journal_v3_reset_disk(sb, last_sequence,
+					    descriptor_buf, control_buf,
+					    descriptor_block, payload_start,
+					    payload_blocks, commit_block);
+	if (!err)
+		cryexts_journal_v3_clear_runtime(sbi);
+	goto out;
+
+corrupt:
+	err = -EUCLEAN;
+out:
+	sbi->journal_replaying = false;
+	kfree(payload_buf);
+	kfree(commit_buf);
+	kfree(descriptor_buf);
+	kfree(control_buf);
+	return err;
+}
+
 int cryexts_journal_begin(struct super_block *sb)
 {
 	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
@@ -1041,6 +2006,8 @@ int cryexts_journal_begin(struct super_block *sb)
 
 	if (!sbi->journal_enabled || sbi->journal_replaying)
 		return 0;
+	if (cryexts_journal_uses_v3(sb))
+		return cryexts_journal_v3_begin(sb);
 	if (cryexts_journal_uses_v2(sb))
 		return cryexts_journal_v2_begin(sb);
 
@@ -1068,6 +2035,8 @@ int cryexts_journal_record_block(struct super_block *sb, u64 home_block)
 
 	if (!sbi->journal_enabled || sbi->journal_replaying)
 		return 0;
+	if (cryexts_journal_uses_v3(sb))
+		return cryexts_journal_v3_record_block(sb, home_block);
 	if (cryexts_journal_uses_v2(sb))
 		return cryexts_journal_v2_record_block(sb, home_block);
 	if (!sbi->journal_blocks)
@@ -1157,6 +2126,8 @@ int cryexts_journal_commit(struct super_block *sb)
 			mutex_unlock(&sbi->journal_lock);
 		return 0;
 	}
+	if (cryexts_journal_uses_v3(sb))
+		return cryexts_journal_v3_commit(sb);
 	if (cryexts_journal_uses_v2(sb))
 		return cryexts_journal_v2_commit(sb);
 
@@ -1193,6 +2164,10 @@ void cryexts_journal_abort(struct super_block *sb)
 			mutex_unlock(&sbi->journal_lock);
 		return;
 	}
+	if (cryexts_journal_uses_v3(sb)) {
+		cryexts_journal_v3_abort(sb);
+		return;
+	}
 	if (cryexts_journal_uses_v2(sb)) {
 		cryexts_journal_v2_abort(sb);
 		return;
@@ -1219,7 +2194,11 @@ int cryexts_journal_replay(struct super_block *sb)
 	u64 sequence;
 	int err = 0;
 
-	if (!sbi->journal_enabled || !cryexts_journal_needs_recovery(sb))
+	if (!sbi->journal_enabled)
+		return 0;
+	if (cryexts_journal_uses_v3(sb))
+		return cryexts_journal_v3_replay(sb);
+	if (!cryexts_journal_needs_recovery(sb))
 		return 0;
 	if (cryexts_journal_uses_v2(sb))
 		return cryexts_journal_v2_replay(sb);

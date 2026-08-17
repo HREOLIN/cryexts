@@ -268,6 +268,9 @@ static int cryexts_writepage_locked(struct page *page,
 						 page_buf + page_off);
 		if (err)
 			goto out_unmap;
+		err = cryexts_sync_inode_block(inode, physical);
+		if (err)
+			goto out_unmap;
 	}
 	kunmap_local(page_buf);
 

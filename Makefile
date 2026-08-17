@@ -13,7 +13,7 @@ all: module tools
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-tools: mkfs.cryexts cryextsck cryexts_journal_inject cryexts_journal_v2_inject cryexts_orphan_inject cryexts_extent_inspect cryexts_dir_index_inspect cryexts_policy_inspect cryexts_journal_inspect cryexts_alloc_inspect cryexts_xattr_inspect cryexts_gdt_inspect
+tools: mkfs.cryexts cryextsck cryexts_journal_inject cryexts_journal_v2_inject cryexts_journal_v3_inject cryexts_orphan_inject cryexts_extent_inspect cryexts_dir_index_inspect cryexts_policy_inspect cryexts_journal_inspect cryexts_alloc_inspect cryexts_xattr_inspect cryexts_gdt_inspect
 
 mkfs.cryexts: tools/mkfs.cryexts.c cryexts_fs.h
 	$(CC) -Wall -Wextra -O2 -I. -o $@ tools/mkfs.cryexts.c
@@ -26,6 +26,9 @@ cryexts_journal_inject: tools/cryexts_journal_inject.c cryexts_fs.h
 
 cryexts_journal_v2_inject: tools/cryexts_journal_v2_inject.c cryexts_fs.h
 	$(CC) -Wall -Wextra -O2 -I. -o $@ tools/cryexts_journal_v2_inject.c
+
+cryexts_journal_v3_inject: tools/cryexts_journal_v3_inject.c cryexts_fs.h
+	$(CC) -Wall -Wextra -O2 -I. -o $@ tools/cryexts_journal_v3_inject.c
 
 cryexts_orphan_inject: tools/cryexts_orphan_inject.c cryexts_fs.h
 	$(CC) -Wall -Wextra -O2 -I. -o $@ tools/cryexts_orphan_inject.c
@@ -57,4 +60,4 @@ test-image: mkfs.cryexts
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	$(RM) mkfs.cryexts cryextsck cryexts_journal_inject cryexts_journal_v2_inject cryexts_orphan_inject cryexts_extent_inspect cryexts_dir_index_inspect cryexts_policy_inspect cryexts_journal_inspect cryexts_alloc_inspect cryexts_xattr_inspect cryexts_gdt_inspect cryexts.img
+	$(RM) mkfs.cryexts cryextsck cryexts_journal_inject cryexts_journal_v2_inject cryexts_journal_v3_inject cryexts_orphan_inject cryexts_extent_inspect cryexts_dir_index_inspect cryexts_policy_inspect cryexts_journal_inspect cryexts_alloc_inspect cryexts_xattr_inspect cryexts_gdt_inspect cryexts.img

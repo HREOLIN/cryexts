@@ -180,7 +180,9 @@ static int cryexts_validate_super(struct super_block *sb)
 	      CRYEXTS_FEATURE_INCOMPAT_ORPHAN_LIST |
 	      CRYEXTS_FEATURE_INCOMPAT_POLICY_TABLE |
 	      CRYEXTS_FEATURE_INCOMPAT_EXTENT_TREE |
-	      CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2) ||
+	      CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 |
+	      CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3 |
+	      CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING) ||
 	    (le32_to_cpu(disk_sb->features_ro_compat) &
 	     ~(CRYEXTS_FEATURE_RO_COMPAT_METADATA_CSUM |
 	       CRYEXTS_FEATURE_RO_COMPAT_LARGE_XATTR)))
@@ -319,16 +321,27 @@ static int cryexts_validate_v5_layout(struct super_block *sb)
 		    CRYEXTS_METADATA_CSUM_FNV1A32)
 		return -EINVAL;
 	if (version < CRYEXTS_VERSION_V6 &&
-	    (incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2))
+	    (incompat & (CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 |
+			   CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3)))
+		return -EINVAL;
+	if ((incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2) &&
+	    (incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3))
+		return -EINVAL;
+	if ((incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING) &&
+	    (!(incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3) ||
+	     version < CRYEXTS_VERSION_V6))
 		return -EINVAL;
 	if (version >= CRYEXTS_VERSION_V6 &&
-	    (incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2)) {
+	    (incompat & (CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 |
+			   CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3))) {
 		u32 compat = le32_to_cpu(disk_sb->features_compat);
+		u64 min_blocks = incompat & CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3 ?
+			CRYEXTS_JOURNAL_V3_MIN_BLOCKS :
+			CRYEXTS_JOURNAL_V2_MIN_BLOCKS;
 
 		if (!(compat & CRYEXTS_FEATURE_COMPAT_HAS_JOURNAL))
 			return -EINVAL;
-		if (le64_to_cpu(disk_sb->journal_blocks) <
-		    CRYEXTS_JOURNAL_V2_MIN_BLOCKS)
+		if (le64_to_cpu(disk_sb->journal_blocks) < min_blocks)
 			return -EINVAL;
 	}
 
@@ -357,7 +370,8 @@ static void cryexts_put_super(struct super_block *sb)
 
 	if (!sbi)
 		return;
-	if (le32_to_cpu(sbi->disk_sb->version) >= CRYEXTS_VERSION_V4) {
+	if (!(sb->s_flags & SB_RDONLY) &&
+	    le32_to_cpu(sbi->disk_sb->version) >= CRYEXTS_VERSION_V4) {
 		cryexts_set_state(sb, CRYEXTS_FS_STATE_CLEAN, 0);
 		sbi->disk_sb->last_write_time =
 			cpu_to_le64(ktime_get_real_seconds());
@@ -527,12 +541,20 @@ static int cryexts_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->journal_active_sequence = 0;
 	sbi->journal_tail_sequence = sbi->journal_sequence;
 	sbi->journal_checkpoint_sequence = sbi->journal_sequence;
+	sbi->journal_ring_head = sbi->journal_block + 1;
+	sbi->journal_ring_tail = sbi->journal_block + 1;
 	sbi->journal_enabled =
 		!!(le32_to_cpu(disk_sb->features_compat) &
 		   CRYEXTS_FEATURE_COMPAT_HAS_JOURNAL);
 	sbi->journal_v2 =
 		!!(le32_to_cpu(disk_sb->features_incompat) &
 		   CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2);
+	sbi->journal_v3 =
+		!!(le32_to_cpu(disk_sb->features_incompat) &
+		   CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3);
+	sbi->journal_ring =
+		!!(le32_to_cpu(disk_sb->features_incompat) &
+		   CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING);
 	sbi->encrypted =
 		!!(le32_to_cpu(disk_sb->flags) & CRYEXTS_SB_FLAG_ENCRYPTED);
 	sbi->key_verifier = le32_to_cpu(disk_sb->key_hash);
@@ -588,7 +610,8 @@ static int cryexts_fill_super(struct super_block *sb, void *data, int silent)
 		pr_err("cryexts: journal replay failed (%d)\n", ret);
 		goto failed;
 	}
-	if (cryexts_orphan_feature_enabled(sb) &&
+	if (!(sb->s_flags & SB_RDONLY) &&
+	    cryexts_orphan_feature_enabled(sb) &&
 	    le64_to_cpu(disk_sb->orphan_head)) {
 		if (sbi->journal_enabled) {
 			ret = cryexts_journal_begin(sb);
@@ -615,7 +638,8 @@ static int cryexts_fill_super(struct super_block *sb, void *data, int silent)
 		}
 	}
 
-	if (le32_to_cpu(disk_sb->version) >= CRYEXTS_VERSION_V4) {
+	if (!(sb->s_flags & SB_RDONLY) &&
+	    le32_to_cpu(disk_sb->version) >= CRYEXTS_VERSION_V4) {
 		u32 mount_count = le32_to_cpu(disk_sb->mount_count);
 
 		disk_sb->mount_count = cpu_to_le32(mount_count + 1);
