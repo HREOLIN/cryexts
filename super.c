@@ -370,6 +370,9 @@ static void cryexts_put_super(struct super_block *sb)
 
 	if (!sbi)
 		return;
+	cancel_work_sync(&sbi->journal_checkpoint_work);
+	if (!(sb->s_flags & SB_RDONLY) && sbi->journal_v3 && sbi->journal_ring)
+		cryexts_journal_checkpoint_sync(sb);
 	if (!(sb->s_flags & SB_RDONLY) &&
 	    le32_to_cpu(sbi->disk_sb->version) >= CRYEXTS_VERSION_V4) {
 		cryexts_set_state(sb, CRYEXTS_FS_STATE_CLEAN, 0);
@@ -510,6 +513,8 @@ static int cryexts_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->sb = sb;
 	mutex_init(&sbi->alloc_lock);
 	mutex_init(&sbi->journal_lock);
+	INIT_WORK(&sbi->journal_checkpoint_work,
+		  cryexts_journal_checkpoint_worker);
 
 	sbi->s_sbh = sb_bread(sb, 0);
 	if (!sbi->s_sbh) {

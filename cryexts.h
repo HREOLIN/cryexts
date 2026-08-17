@@ -4,6 +4,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
+#include <linux/workqueue.h>
 #include <linux/crypto.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
@@ -79,6 +80,8 @@ struct cryexts_sb_info {
 	int journal_error;
 	u64 journal_home_blocks[CRYEXTS_JOURNAL_MAX_ENTRIES];
 	struct crypto_skcipher *skcipher;
+	struct work_struct journal_checkpoint_work;
+	bool journal_checkpoint_pending;
 	struct mutex alloc_lock;
 	struct mutex journal_lock;
 };
@@ -221,6 +224,8 @@ int cryexts_journal_record_block(struct super_block *sb, u64 home_block);
 int cryexts_journal_commit(struct super_block *sb);
 void cryexts_journal_abort(struct super_block *sb);
 int cryexts_journal_replay(struct super_block *sb);
+void cryexts_journal_checkpoint_worker(struct work_struct *work);
+int cryexts_journal_checkpoint_sync(struct super_block *sb);
 bool cryexts_journal_uses_v2(struct super_block *sb);
 bool cryexts_orphan_feature_enabled(struct super_block *sb);
 int cryexts_orphan_set(struct super_block *sb, u64 ino);
