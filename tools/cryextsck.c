@@ -116,6 +116,20 @@ static int has_journal_v2(const struct cryexts_super_block *sb)
 		  CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2);
 }
 
+static int has_journal_v3(const struct cryexts_super_block *sb)
+{
+	return has_journal(sb) &&
+	       !!(le32toh(sb->features_incompat) &
+		  CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3);
+}
+
+static int has_journal_ring(const struct cryexts_super_block *sb)
+{
+	return has_journal_v3(sb) &&
+	       !!(le32toh(sb->features_incompat) &
+		  CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING);
+}
+
 static uint32_t journal_checksum(const void *buf, size_t len)
 {
 	const uint8_t *bytes = buf;
@@ -152,6 +166,18 @@ static uint32_t journal_v2_checksum(const void *buf, size_t len,
 				    size_t checksum_offset)
 {
 	return journal_checksum_skip(buf, len, checksum_offset, sizeof(__le32));
+}
+
+static uint32_t journal_fnv1a_update(uint32_t hash, const void *buf, size_t len)
+{
+	const uint8_t *bytes = buf;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+	return hash;
 }
 
 static uint64_t journal_v2_descriptor_block(const struct cryexts_super_block *sb)
@@ -618,7 +644,9 @@ static int validate_super(const struct cryexts_super_block *sb)
 	       CRYEXTS_FEATURE_INCOMPAT_ORPHAN_LIST |
 	       CRYEXTS_FEATURE_INCOMPAT_POLICY_TABLE |
 	       CRYEXTS_FEATURE_INCOMPAT_EXTENT_TREE |
-	       CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2)) ||
+	       CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 |
+	       CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3 |
+	       CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING)) ||
 	    (le32toh(sb->features_ro_compat) &
 	     ~(CRYEXTS_FEATURE_RO_COMPAT_METADATA_CSUM |
 	       CRYEXTS_FEATURE_RO_COMPAT_LARGE_XATTR))) {
@@ -756,8 +784,19 @@ static int validate_super(const struct cryexts_super_block *sb)
 			}
 			if (version < CRYEXTS_VERSION_V6 &&
 			    (le32toh(sb->features_incompat) &
-			     CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2)) {
-				report("journal v2 feature requires version 6");
+			     (CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 |
+			      CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3))) {
+				report("journal v2/v3 feature requires version 6");
+				ok = 0;
+			}
+			if (has_journal_v2(sb) && has_journal_v3(sb)) {
+				report("journal v2 and v3 features are mutually exclusive");
+				ok = 0;
+			}
+			if ((le32toh(sb->features_incompat) &
+			     CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING) &&
+			    (!has_journal_v3(sb) || version < CRYEXTS_VERSION_V6)) {
+				report("journal ring feature requires journal v3 version 6");
 				ok = 0;
 			}
 			if (version >= CRYEXTS_VERSION_V6 &&
@@ -769,6 +808,18 @@ static int validate_super(const struct cryexts_super_block *sb)
 				}
 				if (journal_blocks < CRYEXTS_JOURNAL_V2_MIN_BLOCKS) {
 					report("journal v2 area is too small");
+					ok = 0;
+				}
+			}
+			if (version >= CRYEXTS_VERSION_V6 &&
+			    (le32toh(sb->features_incompat) &
+			     CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3)) {
+				if (!has_journal(sb)) {
+					report("journal v3 feature set without journal");
+					ok = 0;
+				}
+				if (journal_blocks < CRYEXTS_JOURNAL_V3_MIN_BLOCKS) {
+					report("journal v3 area is too small");
 					ok = 0;
 				}
 			}
@@ -815,6 +866,302 @@ static int validate_journal_header(int fd,
 
 	if (!has_journal(sb))
 		return 0;
+
+	if (has_journal_v3(sb)) {
+		unsigned char descriptor_block[CRYEXTS_BLOCK_SIZE];
+		unsigned char commit_block[CRYEXTS_BLOCK_SIZE];
+		unsigned char payload_block_data[CRYEXTS_BLOCK_SIZE];
+		const struct cryexts_journal_v3_control *control =
+			(const struct cryexts_journal_v3_control *)header_block;
+		const struct cryexts_journal_v3_descriptor *descriptor;
+		const struct cryexts_journal_v3_commit *v3_commit;
+		uint64_t descriptor_blocknr = le64toh(sb->journal_block) + 1;
+		uint64_t payload_start = le64toh(sb->journal_block) + 2;
+		uint64_t payload_blocks = le64toh(sb->journal_blocks) - 3;
+		uint64_t commit_blocknr = le64toh(sb->journal_block) +
+			le64toh(sb->journal_blocks) - 1;
+		uint64_t last_sequence;
+		uint32_t state;
+
+		if (le32toh(control->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+		    le16toh(control->layout_version) !=
+			    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+		    le16toh(control->block_type) !=
+			    CRYEXTS_JOURNAL_V3_BLOCK_CONTROL) {
+			report("journal v3 control header is invalid");
+			return -1;
+		}
+		if (le32toh(control->features) !=
+		    (CRYEXTS_JOURNAL_V3_FEATURE_REDO |
+		     (has_journal_ring(sb) ? CRYEXTS_JOURNAL_V3_FEATURE_RING : 0))) {
+			report("journal v3 control features are invalid");
+			return -1;
+		}
+		state = le32toh(control->state);
+		if (state > CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING) {
+			report("journal v3 control state is invalid");
+			return -1;
+		}
+		if (!has_journal_ring(sb) &&
+		    (le64toh(control->descriptor_block) != descriptor_blocknr ||
+		     le64toh(control->payload_start) != payload_start ||
+		     le64toh(control->payload_blocks) != payload_blocks ||
+		     le64toh(control->commit_block) != commit_blocknr)) {
+			report("journal v3 control layout does not match journal area");
+			return -1;
+		}
+		if (has_journal_ring(sb)) {
+			if (le64toh(control->ring_start) != descriptor_blocknr ||
+			    le64toh(control->ring_end) !=
+				le64toh(sb->journal_block) + le64toh(sb->journal_blocks) ||
+			    le64toh(control->ring_head) < descriptor_blocknr ||
+			    le64toh(control->ring_head) >= le64toh(control->ring_end) ||
+			    le64toh(control->ring_tail) < descriptor_blocknr ||
+			    le64toh(control->ring_tail) >= le64toh(control->ring_end) ||
+			    (state == CRYEXTS_JOURNAL_V3_STATE_IDLE &&
+			     le64toh(control->ring_head) !=
+				     le64toh(control->ring_tail))) {
+				report("journal ring control state is invalid");
+				return -1;
+			}
+			if (le64toh(control->descriptor_block) <
+				descriptor_blocknr ||
+			    le64toh(control->payload_start) !=
+				le64toh(control->descriptor_block) + 1 ||
+			    le64toh(control->commit_block) !=
+				le64toh(control->payload_start) +
+				le64toh(control->payload_blocks) ||
+			    le64toh(control->commit_block) >=
+				le64toh(control->ring_end)) {
+				report("journal ring transaction layout is invalid");
+				return -1;
+			}
+		} else if (le64toh(control->ring_start) ||
+			   le64toh(control->ring_end) ||
+			   le64toh(control->ring_head) ||
+			   le64toh(control->ring_tail)) {
+			report("legacy journal v3 has unexpected ring state");
+			return -1;
+		}
+		stored_checksum = le32toh(control->checksum);
+		expected_checksum = journal_v2_checksum(
+			header_block, CRYEXTS_BLOCK_SIZE,
+			offsetof(struct cryexts_journal_v3_control, checksum));
+		if (stored_checksum != expected_checksum) {
+			report("journal v3 control checksum mismatch");
+			return -1;
+		}
+
+		if (has_journal_ring(sb)) {
+			descriptor_blocknr = le64toh(control->descriptor_block);
+			payload_start = le64toh(control->payload_start);
+			payload_blocks = le64toh(control->payload_blocks);
+			commit_blocknr = le64toh(control->commit_block);
+		}
+		if (read_full(fd, descriptor_block, sizeof(descriptor_block),
+			      descriptor_blocknr * CRYEXTS_BLOCK_SIZE) < 0) {
+			perror("read journal v3 descriptor");
+			return -1;
+		}
+		if (read_full(fd, commit_block, sizeof(commit_block),
+			      commit_blocknr * CRYEXTS_BLOCK_SIZE) < 0) {
+			perror("read journal v3 commit");
+			return -1;
+		}
+
+		descriptor =
+			(const struct cryexts_journal_v3_descriptor *)descriptor_block;
+		if (le32toh(descriptor->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+		    le16toh(descriptor->layout_version) !=
+			    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+		    le16toh(descriptor->block_type) !=
+			    CRYEXTS_JOURNAL_V3_BLOCK_DESCRIPTOR) {
+			report("journal v3 descriptor header is invalid");
+			return -1;
+		}
+		entries = le32toh(descriptor->entry_count);
+		if (entries > CRYEXTS_JOURNAL_V3_MAX_ENTRIES ||
+		    entries > payload_blocks) {
+			report("journal v3 descriptor entry count is invalid");
+			return -1;
+		}
+		if (le64toh(descriptor->payload_start) != payload_start ||
+		    le64toh(descriptor->commit_block) != commit_blocknr) {
+			report("journal v3 descriptor layout is invalid");
+			return -1;
+		}
+		stored_checksum = le32toh(descriptor->checksum);
+		expected_checksum = journal_v2_checksum(
+			descriptor_block, CRYEXTS_BLOCK_SIZE,
+			offsetof(struct cryexts_journal_v3_descriptor, checksum));
+		if (stored_checksum != expected_checksum) {
+			report("journal v3 descriptor checksum mismatch");
+			return -1;
+		}
+
+		v3_commit = (const struct cryexts_journal_v3_commit *)commit_block;
+		if (le32toh(v3_commit->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+		    le16toh(v3_commit->layout_version) !=
+			    CRYEXTS_JOURNAL_V3_LAYOUT_VERSION ||
+		    le16toh(v3_commit->block_type) !=
+			    CRYEXTS_JOURNAL_V3_BLOCK_COMMIT) {
+			report("journal v3 commit header is invalid");
+			return -1;
+		}
+		if (le64toh(v3_commit->descriptor_block) != descriptor_blocknr) {
+			report("journal v3 commit descriptor pointer is invalid");
+			return -1;
+		}
+		stored_checksum = le32toh(v3_commit->checksum);
+		expected_checksum = journal_v2_checksum(
+			commit_block, CRYEXTS_BLOCK_SIZE,
+			offsetof(struct cryexts_journal_v3_commit, checksum));
+		if (stored_checksum != expected_checksum) {
+			report("journal v3 commit checksum mismatch");
+			return -1;
+		}
+
+		if (state != CRYEXTS_JOURNAL_V3_STATE_IDLE) {
+			uint64_t active_sequence =
+				le64toh(control->active_sequence);
+			uint64_t control_last_sequence =
+				le64toh(control->last_sequence);
+			uint64_t checkpoint_sequence =
+				le64toh(control->checkpoint_sequence);
+			uint32_t aggregate_checksum = 2166136261u;
+			uint32_t commit_flags = le32toh(v3_commit->flags);
+
+			if (!active_sequence ||
+			    le64toh(descriptor->sequence) != active_sequence) {
+				report("journal v3 active sequence is inconsistent");
+				return -1;
+			}
+			if (checkpoint_sequence > control_last_sequence ||
+			    active_sequence > control_last_sequence + 1 ||
+			    (state == CRYEXTS_JOURNAL_V3_STATE_PREPARED &&
+			     active_sequence != control_last_sequence + 1) ||
+			    (state == CRYEXTS_JOURNAL_V3_STATE_CHECKPOINTING &&
+			     active_sequence != control_last_sequence)) {
+				report("journal v3 control sequence window is invalid");
+				return -1;
+			}
+			if (le32toh(descriptor->flags)) {
+				report("journal v3 descriptor flags are invalid");
+				return -1;
+			}
+			for (i = entries; i < CRYEXTS_JOURNAL_V3_MAX_ENTRIES; i++) {
+				if (le64toh(descriptor->entries[i].home_block) ||
+				    le32toh(descriptor->entries[i].payload_checksum) ||
+				    le32toh(descriptor->entries[i].flags)) {
+					report("journal v3 descriptor has non-zero trailing entries");
+					return -1;
+				}
+			}
+
+			if (!(commit_flags & CRYEXTS_JOURNAL_V3_FLAG_COMMITTED)) {
+				report("journal v3 uncommitted transaction pending");
+				return -1;
+			}
+			if (state == CRYEXTS_JOURNAL_V3_STATE_ACTIVE ||
+			    commit_flags != CRYEXTS_JOURNAL_V3_FLAG_COMMITTED ||
+			    le32toh(v3_commit->entry_count) != entries ||
+			    le64toh(v3_commit->sequence) != active_sequence ||
+			    le32toh(v3_commit->descriptor_checksum) !=
+				    le32toh(descriptor->checksum)) {
+				report("journal v3 committed transaction is inconsistent");
+				return -1;
+			}
+
+			for (i = 0; i < entries; i++) {
+				uint64_t home =
+					le64toh(descriptor->entries[i].home_block);
+				uint32_t payload_stored = le32toh(
+					descriptor->entries[i].payload_checksum);
+				uint32_t payload_expected;
+				unsigned int j;
+
+				if (home >= blocks_count ||
+				    (home >= le64toh(sb->journal_block) &&
+				     home < le64toh(sb->journal_block) +
+					    le64toh(sb->journal_blocks))) {
+					report("journal v3 home block is invalid");
+					return -1;
+				}
+				if (le32toh(descriptor->entries[i].flags)) {
+					report("journal v3 entry flags are invalid");
+					return -1;
+				}
+				for (j = 0; j < i; j++) {
+					if (le64toh(descriptor->entries[j].home_block) ==
+					    home) {
+						report("journal v3 duplicate home block");
+						return -1;
+					}
+				}
+				if (read_full(fd, payload_block_data,
+					      sizeof(payload_block_data),
+					      (payload_start + i) *
+						      CRYEXTS_BLOCK_SIZE) < 0) {
+					perror("read journal v3 payload");
+					return -1;
+				}
+				payload_expected = journal_fnv1a_update(
+					2166136261u, payload_block_data,
+					sizeof(payload_block_data));
+				if (payload_stored != payload_expected) {
+					report("journal v3 payload checksum mismatch");
+					return -1;
+				}
+				aggregate_checksum = journal_fnv1a_update(
+					aggregate_checksum, payload_block_data,
+					sizeof(payload_block_data));
+			}
+			if (!entries)
+				aggregate_checksum = 0;
+			if (le32toh(v3_commit->payload_checksum) !=
+			    aggregate_checksum) {
+				report("journal v3 aggregate payload checksum mismatch");
+				return -1;
+			}
+
+			report("journal v3 committed transaction replay pending");
+			return -1;
+		}
+
+		last_sequence = le64toh(control->last_sequence);
+		if (le64toh(control->active_sequence) ||
+		    le64toh(control->checkpoint_sequence) != last_sequence ||
+		    (le32toh(sb->state) & CRYEXTS_FS_STATE_NEEDS_RECOVERY)) {
+			report("journal v3 idle control state is inconsistent");
+			return -1;
+		}
+		if (!has_journal_ring(sb) &&
+		    (le32toh(descriptor->flags) || entries ||
+		    le64toh(descriptor->sequence) != last_sequence)) {
+			report("journal v3 idle descriptor is not empty");
+			return -1;
+		}
+		if (has_journal_ring(sb))
+			return 0;
+		for (i = 0; i < CRYEXTS_JOURNAL_V3_MAX_ENTRIES; i++) {
+			if (le64toh(descriptor->entries[i].home_block) ||
+			    le32toh(descriptor->entries[i].payload_checksum) ||
+			    le32toh(descriptor->entries[i].flags)) {
+				report("journal v3 descriptor has non-zero trailing entries");
+				return -1;
+			}
+		}
+		if (le32toh(v3_commit->flags) ||
+		    le32toh(v3_commit->entry_count) ||
+		    le64toh(v3_commit->sequence) != last_sequence ||
+		    le32toh(v3_commit->descriptor_checksum) !=
+			    le32toh(descriptor->checksum) ||
+		    le32toh(v3_commit->payload_checksum)) {
+			report("journal v3 idle commit is inconsistent");
+			return -1;
+		}
+		return 0;
+	}
 
 	if (has_journal_v2(sb)) {
 		unsigned char descriptor_block[CRYEXTS_BLOCK_SIZE];
@@ -2454,7 +2801,7 @@ static int repair_recovery_state(int fd, unsigned char *super_block,
 
 	if (!has_journal(wsb))
 		return 0;
-	if (has_journal_v2(wsb))
+	if (has_journal_v2(wsb) || has_journal_v3(wsb))
 		return 0;
 
 	flags = le32toh(jh->flags);

@@ -240,6 +240,74 @@ static void set_journal_v2_commit_empty(struct cryexts_journal_v2_commit *jc,
 	jc->checksum = htole32(checksum);
 }
 
+static void set_journal_v3_control(struct cryexts_journal_v3_control *jc,
+				   uint64_t journal_block,
+				   uint64_t journal_blocks, int use_ring)
+{
+	uint32_t checksum;
+
+	memset(jc, 0, CRYEXTS_BLOCK_SIZE);
+	jc->magic = htole32(CRYEXTS_JOURNAL_V3_MAGIC);
+	jc->layout_version = htole16(CRYEXTS_JOURNAL_V3_LAYOUT_VERSION);
+	jc->block_type = htole16(CRYEXTS_JOURNAL_V3_BLOCK_CONTROL);
+	jc->state = htole32(CRYEXTS_JOURNAL_V3_STATE_IDLE);
+	jc->features = htole32(CRYEXTS_JOURNAL_V3_FEATURE_REDO |
+				   (use_ring ? CRYEXTS_JOURNAL_V3_FEATURE_RING : 0));
+	jc->descriptor_block = htole64(journal_block + 1);
+	jc->payload_start = htole64(journal_block + 2);
+	jc->payload_blocks = htole64(journal_blocks - 3);
+	jc->commit_block = htole64(journal_block + journal_blocks - 1);
+	if (use_ring) {
+		jc->ring_start = htole64(journal_block + 1);
+		jc->ring_end = htole64(journal_block + journal_blocks);
+		jc->ring_head = jc->ring_start;
+		jc->ring_tail = jc->ring_start;
+	}
+	checksum = journal_checksum_skip(
+		jc, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_control, checksum),
+		sizeof(jc->checksum));
+	jc->checksum = htole32(checksum);
+}
+
+static void set_journal_v3_descriptor_empty(
+	struct cryexts_journal_v3_descriptor *jd, uint64_t payload_start,
+	uint64_t commit_block)
+{
+	uint32_t checksum;
+
+	memset(jd, 0, CRYEXTS_BLOCK_SIZE);
+	jd->magic = htole32(CRYEXTS_JOURNAL_V3_MAGIC);
+	jd->layout_version = htole16(CRYEXTS_JOURNAL_V3_LAYOUT_VERSION);
+	jd->block_type = htole16(CRYEXTS_JOURNAL_V3_BLOCK_DESCRIPTOR);
+	jd->payload_start = htole64(payload_start);
+	jd->commit_block = htole64(commit_block);
+	checksum = journal_checksum_skip(
+		jd, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_descriptor, checksum),
+		sizeof(jd->checksum));
+	jd->checksum = htole32(checksum);
+}
+
+static void set_journal_v3_commit_empty(struct cryexts_journal_v3_commit *jc,
+					uint64_t descriptor_block,
+					uint32_t descriptor_checksum)
+{
+	uint32_t checksum;
+
+	memset(jc, 0, CRYEXTS_BLOCK_SIZE);
+	jc->magic = htole32(CRYEXTS_JOURNAL_V3_MAGIC);
+	jc->layout_version = htole16(CRYEXTS_JOURNAL_V3_LAYOUT_VERSION);
+	jc->block_type = htole16(CRYEXTS_JOURNAL_V3_BLOCK_COMMIT);
+	jc->descriptor_block = htole64(descriptor_block);
+	jc->descriptor_checksum = htole32(descriptor_checksum);
+	checksum = journal_checksum_skip(
+		jc, CRYEXTS_BLOCK_SIZE,
+		offsetof(struct cryexts_journal_v3_commit, checksum),
+		sizeof(jc->checksum));
+	jc->checksum = htole32(checksum);
+}
+
 static void set_super_checksum(struct cryexts_super_block *sb)
 {
 	uint32_t seed;
@@ -352,7 +420,7 @@ static uint64_t get_device_size(int fd)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [-f] [-G] [-X] [-A] [-I] [-O] [-T] [-M] [-J] [-L label] [-P policy_id] [-E key] <image-or-device> [size_MB]\n",
+		"Usage: %s [-f] [-G] [-X] [-A] [-I] [-O] [-T] [-M] [-J|-R|-Q] [-L label] [-P policy_id] [-E key] <image-or-device> [size_MB]\n",
 		prog);
 }
 
@@ -385,6 +453,8 @@ int main(int argc, char **argv)
 	int use_policy_table = 0;
 	int use_metadata_csum = 0;
 	int use_journal_v2 = 0;
+	int use_journal_v3 = 0;
+	int use_journal_ring = 0;
 	int fd;
 	int opt;
 	uint32_t default_policy_id = 0;
@@ -407,7 +477,7 @@ int main(int argc, char **argv)
 	uint16_t policy_entry_count = 0;
 	unsigned char *gdt_region = NULL;
 
-	while ((opt = getopt(argc, argv, "fGXAIOTMJP:L:E:h")) != -1) {
+	while ((opt = getopt(argc, argv, "fGXAIOTMJRQP:L:E:h")) != -1) {
 		switch (opt) {
 		case 'f':
 			force = 1;
@@ -438,6 +508,17 @@ int main(int argc, char **argv)
 			use_block_groups = 1;
 			fs_version = CRYEXTS_VERSION_V6;
 			break;
+	case 'R':
+		use_journal_v3 = 1;
+		use_block_groups = 1;
+		fs_version = CRYEXTS_VERSION_V6;
+		break;
+	case 'Q':
+		use_journal_v3 = 1;
+		use_journal_ring = 1;
+		use_block_groups = 1;
+		fs_version = CRYEXTS_VERSION_V6;
+		break;
 		case 'P':
 			default_policy_id = (uint32_t)strtoul(optarg, NULL, 10);
 			use_xattrs = 1;
@@ -460,6 +541,10 @@ int main(int argc, char **argv)
 
 	if (optind >= argc) {
 		usage(argv[0]);
+		return 1;
+	}
+	if (use_journal_v2 && use_journal_v3) {
+		fprintf(stderr, "journal v2 and v3 cannot be enabled together\n");
 		return 1;
 	}
 
@@ -583,6 +668,15 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
+	if (use_journal_v3) {
+		if (!journal_block || journal_blocks < CRYEXTS_JOURNAL_V3_MIN_BLOCKS) {
+			fprintf(stderr,
+				"journal v3 requires at least %u reserved journal blocks\n",
+				CRYEXTS_JOURNAL_V3_MIN_BLOCKS);
+			close(fd);
+			return 1;
+		}
+	}
 
 	memset(block, 0, sizeof(block));
 	sb = (struct cryexts_super_block *)(block + CRYEXTS_SUPER_OFFSET);
@@ -644,6 +738,8 @@ int main(int argc, char **argv)
 		(use_policy_table ? CRYEXTS_FEATURE_INCOMPAT_POLICY_TABLE : 0) |
 		(use_extents ? CRYEXTS_FEATURE_INCOMPAT_EXTENT_TREE : 0) |
 		(use_journal_v2 ? CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V2 : 0) |
+		(use_journal_v3 ? CRYEXTS_FEATURE_INCOMPAT_JOURNAL_V3 : 0) |
+		(use_journal_ring ? CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING : 0) |
 		(use_xattrs ? (CRYEXTS_FEATURE_INCOMPAT_XATTR |
 			       CRYEXTS_FEATURE_INCOMPAT_ENCRYPTION_POLICY) : 0));
 	if (journal_blocks > 0)
@@ -942,7 +1038,44 @@ int main(int argc, char **argv)
 				return 1;
 			}
 		}
-		if (use_journal_v2) {
+		if (use_journal_v3) {
+			struct cryexts_journal_v3_control *jc;
+			struct cryexts_journal_v3_descriptor *jd;
+			struct cryexts_journal_v3_commit *jcommit;
+			uint32_t descriptor_checksum;
+
+			jc = (struct cryexts_journal_v3_control *)block;
+			set_journal_v3_control(jc, journal_block, journal_blocks,
+					       use_journal_ring);
+			if (write_full(fd, block, sizeof(block),
+				       journal_block * CRYEXTS_BLOCK_SIZE) < 0) {
+				perror("write journal v3 control block");
+				close(fd);
+				return 1;
+			}
+
+			jd = (struct cryexts_journal_v3_descriptor *)block;
+			set_journal_v3_descriptor_empty(jd, journal_block + 2,
+							journal_block + journal_blocks - 1);
+			descriptor_checksum = le32toh(jd->checksum);
+			if (write_full(fd, block, sizeof(block),
+				       (journal_block + 1) * CRYEXTS_BLOCK_SIZE) < 0) {
+				perror("write journal v3 descriptor block");
+				close(fd);
+				return 1;
+			}
+
+			jcommit = (struct cryexts_journal_v3_commit *)block;
+			set_journal_v3_commit_empty(jcommit, journal_block + 1,
+						    descriptor_checksum);
+			if (write_full(fd, block, sizeof(block),
+				       (journal_block + journal_blocks - 1) *
+					       CRYEXTS_BLOCK_SIZE) < 0) {
+				perror("write journal v3 commit block");
+				close(fd);
+				return 1;
+			}
+		} else if (use_journal_v2) {
 			struct cryexts_journal_v2_control *jc;
 			struct cryexts_journal_v2_descriptor *jd;
 			struct cryexts_journal_v2_commit *jcommit;
@@ -1010,7 +1143,9 @@ int main(int argc, char **argv)
 		       (unsigned long long)journal_blocks);
 	if (journal_blocks > 0)
 		printf("Journal format: %s\n",
-		       use_journal_v2 ? "v2" : "v1");
+		       use_journal_v3 ? "v3" : use_journal_v2 ? "v2" : "v1");
+	if (use_journal_ring)
+		printf("Journal ring: enabled\n");
 	printf("Prealloc: enabled\n");
 	printf("Dir index: %s\n", use_dir_index ? "enabled" : "disabled");
 	printf("Orphan list: %s\n", use_orphan_list ? "enabled" : "disabled");

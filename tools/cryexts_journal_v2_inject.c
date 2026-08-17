@@ -14,6 +14,7 @@
 #include "../cryexts_fs.h"
 
 #define CRYEXTS_META_TAG_SUPER 0x53555052U
+#define CRYEXTS_V11_ROLLBACK_MARKER "CRYEXTS_V11_V2_COMMITTED_HOME"
 
 static int read_full(int fd, void *buf, size_t len, off_t off)
 {
@@ -142,7 +143,36 @@ static void set_super_checksum(struct cryexts_super_block *sb)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s <image-or-device>\n", prog);
+	fprintf(stderr,
+		"Usage: %s <image-or-device> [recovery|rollback-window]\n",
+		prog);
+}
+
+static int mark_root_dir_slack(unsigned char *block)
+{
+	const char marker[] = CRYEXTS_V11_ROLLBACK_MARKER;
+	size_t offset = 0;
+
+	while (offset < CRYEXTS_BLOCK_SIZE) {
+		struct cryexts_dir_entry *de =
+			(struct cryexts_dir_entry *)(block + offset);
+		unsigned int rec_len = le16toh(de->rec_len);
+		unsigned int used;
+
+		if (rec_len < CRYEXTS_DIR_ENTRY_HEADER_SIZE || rec_len % 4 ||
+		    offset + rec_len > CRYEXTS_BLOCK_SIZE)
+			return -1;
+		used = cryexts_dir_rec_len(de->name_len);
+		if (offset + rec_len == CRYEXTS_BLOCK_SIZE) {
+			if (rec_len < used + sizeof(marker))
+				return -1;
+			memcpy(block + offset + rec_len - sizeof(marker), marker,
+			       sizeof(marker));
+			return 0;
+		}
+		offset += rec_len;
+	}
+	return -1;
 }
 
 int main(int argc, char **argv)
@@ -165,11 +195,20 @@ int main(int argc, char **argv)
 	uint64_t sequence;
 	uint32_t incompat;
 	uint32_t state;
+	int rollback_window = 0;
 	int fd;
 
-	if (argc != 2) {
+	if (argc < 2 || argc > 3) {
 		usage(argv[0]);
 		return 2;
+	}
+	if (argc == 3) {
+		if (!strcmp(argv[2], "rollback-window"))
+			rollback_window = 1;
+		else if (strcmp(argv[2], "recovery")) {
+			usage(argv[0]);
+			return 2;
+		}
 	}
 
 	fd = open(argv[1], O_RDWR);
@@ -308,20 +347,36 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	if (write_full(fd, zero_block, sizeof(zero_block),
+	if (rollback_window && mark_root_dir_slack(home_block) < 0) {
+		fprintf(stderr,
+			"cryexts_journal_v2_inject: root directory has no safe marker slack\n");
+		close(fd);
+		return 1;
+	}
+	if (write_full(fd, rollback_window ? home_block : zero_block,
+		       sizeof(home_block),
 		       root_dir_block * CRYEXTS_BLOCK_SIZE) < 0) {
-		perror("corrupt home block");
+		perror(rollback_window ? "write committed home block" :
+		       "corrupt home block");
+		close(fd);
+		return 2;
+	}
+	if (fsync(fd) < 0) {
+		perror("fsync image");
 		close(fd);
 		return 2;
 	}
 
 	close(fd);
-	printf("Injected v2 recovery scenario into %s\n", argv[1]);
+	printf("Injected v2 %s scenario into %s\n",
+	       rollback_window ? "rollback-window" : "recovery", argv[1]);
 	printf("Control block: %llu\n", (unsigned long long)journal_block);
 	printf("Descriptor block: %llu\n", (unsigned long long)(journal_block + 1));
 	printf("Payload block: %llu\n", (unsigned long long)payload_block);
 	printf("Commit block: %llu\n", (unsigned long long)commit_block_no);
 	printf("Home block: %llu\n", (unsigned long long)root_dir_block);
 	printf("Sequence: %llu\n", (unsigned long long)sequence);
+	if (rollback_window)
+		printf("Home marker: %s\n", CRYEXTS_V11_ROLLBACK_MARKER);
 	return 0;
 }
