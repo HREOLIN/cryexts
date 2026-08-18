@@ -195,8 +195,7 @@ int main(int argc, char **argv)
 
 	if (argc < 2 || argc > 3) {
 		fprintf(stderr,
-			"Usage: %s <image-or-device> [committed|uncommitted-tail]
-",
+			"Usage: %s <image-or-device> [committed|uncommitted-tail]\n",
 			argv[0]);
 		return 2;
 	}
@@ -206,8 +205,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[2], "uncommitted-tail"))
 			scenario = SCENARIO_UNCOMMITTED_TAIL;
 		else {
-			fprintf(stderr, "unknown scenario: %s
-", argv[2]);
+			fprintf(stderr, "unknown scenario: %s\n", argv[2]);
 			return 2;
 		}
 	}
@@ -229,8 +227,7 @@ int main(int argc, char **argv)
 	    !(le32toh(sb->features_incompat) &
 	      CRYEXTS_FEATURE_INCOMPAT_JOURNAL_RING)) {
 		fprintf(stderr,
-			"cryexts_journal_v3_ring_inject: not a journal v3 ring filesystem
-");
+			"cryexts_journal_v3_ring_inject: not a journal v3 ring filesystem\n");
 		close(fd);
 		return 1;
 	}
@@ -238,14 +235,12 @@ int main(int argc, char **argv)
 	journal_block = le64toh(sb->journal_block);
 	journal_blocks = le64toh(sb->journal_blocks);
 	if (!journal_block || journal_blocks < CRYEXTS_JOURNAL_V3_MIN_BLOCKS) {
-		fprintf(stderr, "invalid journal area
-");
+		fprintf(stderr, "invalid journal area\n");
 		close(fd);
 		return 1;
 	}
 	if (RING_TXNS * 3 > journal_blocks - 1) {
-		fprintf(stderr, "journal area too small for %u ring transactions
-",
+		fprintf(stderr, "journal area too small for %u ring transactions\n",
 			RING_TXNS);
 		close(fd);
 		return 1;
@@ -263,8 +258,7 @@ int main(int argc, char **argv)
 	control = (struct cryexts_journal_v3_control *)control_block;
 	if (le32toh(control->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
 	    le32toh(control->state) != CRYEXTS_JOURNAL_V3_STATE_IDLE) {
-		fprintf(stderr, "journal is not clean
-");
+		fprintf(stderr, "journal is not clean\n");
 		close(fd);
 		return 1;
 	}
@@ -272,8 +266,7 @@ int main(int argc, char **argv)
 	ring_end = le64toh(control->ring_end);
 	if (!ring_start || ring_start >= ring_end ||
 	    ring_end != journal_block + journal_blocks) {
-		fprintf(stderr, "invalid journal ring range
-");
+		fprintf(stderr, "invalid journal ring range\n");
 		close(fd);
 		return 1;
 	}
@@ -309,8 +302,7 @@ int main(int argc, char **argv)
 
 		memcpy(payload_block, home_block, sizeof(payload_block));
 		if (mark_root_dir_slack(payload_block, marker) < 0) {
-			fprintf(stderr, "no root directory slack
-");
+			fprintf(stderr, "no root directory slack\n");
 			close(fd);
 			return 1;
 		}
@@ -399,19 +391,14 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	printf("Injected journal v3 ring %s scenario (%u transactions)
-",
+	printf("Injected journal v3 ring %s scenario (%u transactions)\n",
 	       scenario == SCENARIO_COMMITTED ? "committed" : "uncommitted-tail",
 	       RING_TXNS);
-	printf("Home block: %llu
-", (unsigned long long)home_blocknr);
-	printf("Ring start: %llu
-", (unsigned long long)ring_start);
-	printf("Ring head: %llu
-",
+	printf("Home block: %llu\n", (unsigned long long)home_blocknr);
+	printf("Ring start: %llu\n", (unsigned long long)ring_start);
+	printf("Ring head: %llu\n",
 	       (unsigned long long)(ring_start + RING_TXNS * 3));
-	printf("Final sequence: %llu
-", (unsigned long long)final_sequence);
+	printf("Final sequence: %llu\n", (unsigned long long)final_sequence);
 	close(fd);
 	return 0;
 }

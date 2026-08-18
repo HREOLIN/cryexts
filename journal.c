@@ -1416,6 +1416,7 @@ static int cryexts_journal_v3_checkpoint_one(struct super_block *sb)
 	u64 checkpoint_sequence = sbi->journal_checkpoint_sequence;
 	u32 entries;
 	u32 expected;
+	u32 aggregate_checksum = 2166136261u;
 	unsigned int i;
 	int err = -EUCLEAN;
 
@@ -1452,7 +1453,8 @@ static int cryexts_journal_v3_checkpoint_one(struct super_block *sb)
 	commit_block = le64_to_cpu(descriptor->commit_block);
 	if (entries > cryexts_journal_v3_payload_capacity(sbi) ||
 	    payload_start != descriptor_block + 1 ||
-	    commit_block != payload_start + entries)
+	    commit_block != payload_start + entries ||
+	    sequence <= checkpoint_sequence)
 		goto corrupt;
 
 	err = cryexts_read_file_block(sb, commit_block, commit_buf);
@@ -1500,6 +1502,20 @@ static int cryexts_journal_v3_checkpoint_one(struct super_block *sb)
 		if (checksum != le32_to_cpu(
 			    descriptor->entries[i].payload_checksum))
 			goto corrupt;
+		aggregate_checksum = cryexts_fnv1a_update(aggregate_checksum,
+							 payload_buf,
+							 CRYEXTS_BLOCK_SIZE);
+	}
+	if (!entries)
+		aggregate_checksum = 0;
+	if (aggregate_checksum != le32_to_cpu(commit->payload_checksum))
+		goto corrupt;
+	for (i = 0; i < entries; i++) {
+		u64 home_block = le64_to_cpu(descriptor->entries[i].home_block);
+
+		err = cryexts_read_file_block(sb, payload_start + i, payload_buf);
+		if (err)
+			goto out;
 		err = cryexts_journal_v3_write_sync(sb, home_block, payload_buf);
 		if (err)
 			goto out;
@@ -1585,14 +1601,20 @@ static int cryexts_journal_v3_ring_allocate(struct cryexts_sb_info *sbi,
 		*next_head = start;
 		return 0;
 	}
-	if (needed > end - ring_start)
+	if (needed >= end - ring_start)
 		return -ENOSPC;
-	if (start + needed > end) {
-		if (start != tail)
+	if (start == tail) {
+		/* Empty ring: head is normalized after every complete segment. */
+		if (start + needed > end)
+			start = ring_start;
+	} else if (start < tail) {
+		if (start + needed > tail)
+			return -ENOSPC;
+	} else if (start + needed > end) {
+		/* ponytail: use the free prefix; no transaction crosses ring_end. */
+		if (needed > tail - ring_start)
 			return -ENOSPC;
 		start = ring_start;
-	} else if (tail != start && tail > start && tail < start + needed) {
-		return -ENOSPC;
 	}
 	*descriptor_block = start;
 	*payload_start = start + 1;
@@ -1673,6 +1695,7 @@ static int cryexts_journal_v3_commit(struct super_block *sb)
 	u64 next_head;
 	u64 previous_head = sbi->journal_ring_head;
 	u64 previous_tail = sbi->journal_ring_tail;
+	u64 previous_checkpoint = sbi->journal_checkpoint_sequence;
 	u32 entries;
 	u32 descriptor_checksum;
 	u32 payload_checksum = 2166136261u;
@@ -1745,7 +1768,7 @@ static int cryexts_journal_v3_commit(struct super_block *sb)
 
 	cryexts_journal_v3_prepare_control(
 		sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_PREPARED,
-		previous_sequence, sequence, previous_sequence, descriptor_block,
+		previous_sequence, sequence, previous_checkpoint, descriptor_block,
 		payload_start, entries, commit_block);
 	err = cryexts_journal_v3_write_sync(sb, sbi->journal_block, state_buf);
 	if (err)
@@ -1763,7 +1786,7 @@ static int cryexts_journal_v3_commit(struct super_block *sb)
 	if (sbi->journal_ring) {
 		cryexts_journal_v3_prepare_control(
 			sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_COMMITTED,
-			sequence, 0, previous_sequence, descriptor_block,
+			sequence, 0, previous_checkpoint, descriptor_block,
 			payload_start, entries, commit_block);
 		err = cryexts_journal_v3_write_sync(sb, sbi->journal_block,
 						    state_buf);
@@ -1888,6 +1911,22 @@ static int cryexts_journal_v3_reset_disk(struct super_block *sb, u64 sequence,
 	int err;
 
 	if (sbi->journal_ring) {
+		/* Keep the clean control pointers paired with an empty sentinel. */
+		cryexts_journal_v3_prepare_descriptor(
+			sb, descriptor_buf, 0, sequence, payload_start, commit_block);
+		cryexts_journal_v3_finish_descriptor(descriptor_buf);
+		descriptor_checksum = le32_to_cpu(
+			((struct cryexts_journal_v3_descriptor *)descriptor_buf)->checksum);
+		err = cryexts_journal_v3_write_sync(sb, descriptor_block,
+						     descriptor_buf);
+		if (err)
+			return err;
+		cryexts_journal_v3_prepare_commit(sb, state_buf, 0, sequence,
+						  descriptor_checksum, 0, false,
+						  descriptor_block);
+		err = cryexts_journal_v3_write_sync(sb, commit_block, state_buf);
+		if (err)
+			return err;
 		cryexts_journal_v3_prepare_control(
 			sb, state_buf, CRYEXTS_JOURNAL_V3_STATE_IDLE,
 			sequence, 0, sequence, descriptor_block, payload_start,
@@ -1946,11 +1985,13 @@ static int cryexts_journal_v3_replay_ring(struct super_block *sb)
 	u64 commit_block = 0;
 	u64 segment_end = 0;
 	u64 last_sequence;
+	u64 previous_sequence;
 	u64 sequence = 0;
 	u32 state;
 	u32 entries = 0;
 	u32 expected;
 	u32 commit_flags;
+	u32 aggregate_checksum;
 	unsigned int i;
 	bool commit_valid;
 	int err = -EUCLEAN;
@@ -1985,6 +2026,7 @@ static int cryexts_journal_v3_replay_ring(struct super_block *sb)
 
 	state = le32_to_cpu(control->state);
 	last_sequence = le64_to_cpu(control->last_sequence);
+	previous_sequence = le64_to_cpu(control->checkpoint_sequence);
 	head = le64_to_cpu(control->ring_head);
 	position = le64_to_cpu(control->ring_tail);
 
@@ -2026,7 +2068,8 @@ static int cryexts_journal_v3_replay_ring(struct super_block *sb)
 		commit_block = le64_to_cpu(descriptor->commit_block);
 		if (entries > cryexts_journal_v3_payload_capacity(sbi) ||
 		    payload_start != position + 1 ||
-		    commit_block != payload_start + entries)
+		    commit_block != payload_start + entries ||
+		    sequence <= previous_sequence)
 			goto corrupt;
 
 		segment_end = commit_block + 1;
@@ -2058,9 +2101,14 @@ static int cryexts_journal_v3_replay_ring(struct super_block *sb)
 			goto corrupt;
 		}
 		commit_flags = le32_to_cpu(commit->flags);
-		if (commit_flags != CRYEXTS_JOURNAL_V3_FLAG_COMMITTED ||
-		    le32_to_cpu(commit->descriptor_checksum) !=
-			    le32_to_cpu(descriptor->checksum))
+		if (commit_flags != CRYEXTS_JOURNAL_V3_FLAG_COMMITTED) {
+			/* A durable but uncommitted final segment is discarded. */
+			if (segment_end == head)
+				break;
+			goto corrupt;
+		}
+		if (le32_to_cpu(commit->descriptor_checksum) !=
+		    le32_to_cpu(descriptor->checksum))
 			goto corrupt;
 
 		for (i = 0; i < entries; i++) {
@@ -2085,7 +2133,16 @@ static int cryexts_journal_v3_replay_ring(struct super_block *sb)
 			if (le32_to_cpu(descriptor->entries[i].payload_checksum) !=
 			    expected)
 				goto corrupt;
+			if (i == 0)
+				aggregate_checksum = 2166136261u;
+			aggregate_checksum = cryexts_fnv1a_update(aggregate_checksum,
+								 payload_buf,
+								 CRYEXTS_BLOCK_SIZE);
 		}
+		if (!entries)
+			aggregate_checksum = 0;
+		if (aggregate_checksum != le32_to_cpu(commit->payload_checksum))
+			goto corrupt;
 
 		sbi->journal_replaying = true;
 		for (i = 0; i < entries; i++) {
@@ -2103,6 +2160,7 @@ static int cryexts_journal_v3_replay_ring(struct super_block *sb)
 			goto out;
 
 		last_sequence = sequence;
+		previous_sequence = sequence;
 		position = segment_end;
 	}
 

@@ -158,6 +158,11 @@ int main(int argc, char **argv)
 		uint32_t entries;
 		uint32_t aggregate_checksum = 2166136261u;
 		uint32_t i;
+		uint64_t scan_position;
+		uint64_t transaction_count = 0;
+		uint64_t used_blocks = 0;
+		uint64_t first_sequence = 0;
+		uint64_t last_sequence = 0;
 
 		printf("control.magic=%u\n", le32toh(jc->magic));
 		printf("control.layout_version=%u\n", le16toh(jc->layout_version));
@@ -209,7 +214,48 @@ int main(int argc, char **argv)
 		printf("control.checksum=%u\n", le32toh(jc->checksum));
 		printf("control.expected_checksum=%u\n",
 		       journal_v2_checksum(block,
-			 offsetof(struct cryexts_journal_v3_control, checksum)));
+			       offsetof(struct cryexts_journal_v3_control, checksum)));
+		if (journal_ring &&
+		    le64toh(jc->ring_head) != le64toh(jc->ring_tail)) {
+			scan_position = le64toh(jc->ring_tail);
+			while (scan_position != le64toh(jc->ring_head) &&
+			       transaction_count < journal_blocks) {
+				const struct cryexts_journal_v3_descriptor *scan;
+				uint64_t scan_commit;
+				uint64_t scan_next;
+
+				if (read_full(fd, descriptor_block, sizeof(descriptor_block),
+					      scan_position * CRYEXTS_BLOCK_SIZE) < 0)
+					break;
+				scan = (const struct cryexts_journal_v3_descriptor *)
+					descriptor_block;
+				entries = le32toh(scan->entry_count);
+				scan_commit = le64toh(scan->commit_block);
+				if (le32toh(scan->magic) != CRYEXTS_JOURNAL_V3_MAGIC ||
+				    entries > CRYEXTS_JOURNAL_V3_MAX_ENTRIES ||
+				    le64toh(scan->payload_start) != scan_position + 1 ||
+				    scan_commit != scan_position + entries + 1 ||
+				    scan_commit >= le64toh(jc->ring_end))
+					break;
+				scan_next = scan_commit + 1;
+				if (scan_next == le64toh(jc->ring_end))
+					scan_next = le64toh(jc->ring_start);
+				if (!transaction_count)
+					first_sequence = le64toh(scan->sequence);
+				last_sequence = le64toh(scan->sequence);
+				transaction_count++;
+				used_blocks += entries + 2;
+				scan_position = scan_next;
+			}
+		}
+		printf("ring.transaction_count=%llu\n",
+		       (unsigned long long)transaction_count);
+		printf("ring.first_sequence=%llu\n",
+		       (unsigned long long)first_sequence);
+		printf("ring.last_sequence=%llu\n",
+		       (unsigned long long)last_sequence);
+		printf("ring.used_blocks=%llu\n",
+		       (unsigned long long)used_blocks);
 
 		if (read_full(fd, descriptor_block, sizeof(descriptor_block),
 			      le64toh(jc->descriptor_block) * CRYEXTS_BLOCK_SIZE) < 0) {

@@ -73,6 +73,7 @@ make_ring_image "$COMMITTED_IMG"
 inspect_image "$COMMITTED_IMG"
 grep -q '^control.state=3$' "$INSPECT"
 grep -q '^commit.flags=1$' "$INSPECT"
+grep -q '^ring.transaction_count=2$' "$INSPECT"
 HEAD=$(inspect_value 'control.ring_head')
 TAIL=$(inspect_value 'control.ring_tail')
 test -n "$HEAD" && test -n "$TAIL" && test "$HEAD" != "$TAIL"
@@ -93,6 +94,7 @@ make_ring_image "$UNCOMMITTED_IMG"
 inspect_image "$UNCOMMITTED_IMG"
 grep -q '^control.state=2$' "$INSPECT"
 grep -q '^commit.flags=0$' "$INSPECT"
+grep -q '^ring.transaction_count=2$' "$INSPECT"
 HEAD=$(inspect_value 'control.ring_head')
 TAIL=$(inspect_value 'control.ring_tail')
 test -n "$HEAD" && test -n "$TAIL" && test "$HEAD" != "$TAIL"

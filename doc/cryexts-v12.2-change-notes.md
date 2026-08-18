@@ -45,7 +45,7 @@ v12.2 的目标是把 checkpoint 从 commit 路径里拆出来，做成**后台�
 
 - 多 writer / 多 running transaction 并发；
 - transaction 级 data dependency tracking 与 flush/barrier/FUA 抽象；
-- `cryextsck` 对"崩溃后 ring 中存在多笔已提交事务"的完整校验（本版本先保证正常路径与 replay 路径）；
+- `cryextsck` 的完整历史扫描和长时间并发压力测试；本版本的 inspect/replay 已支持多事务 ring，fsck 仍以当前 control 指向事务做快速一致性检查；
 - 并发压力与长时间 soak。
 
 ## 3. 磁盘格式说明
@@ -169,5 +169,6 @@ mount 时 `cryexts_journal_v3_replay()`：
 
 - 单 writer：`journal_lock` 仍串行化 begin -> commit；并发只体现在 checkpoint 与新事务之间；
 - checkpoint 失败会保留 `NEEDS_RECOVERY`，下次 mount 重放；
-- 本版本先覆盖正常路径与 replay 路径；`cryextsck` 对多事务 ring 的崩溃注入校验在后续补强；
+- ring 分配保留一个空闲区分隔，单笔事务不能占满整个 ring；当 head 接近 ring 尾部时，允许回绕到 tail 之前的空闲前缀；
+- checkpoint/replay 会校验每个 payload 以及整笔事务的聚合 checksum，校验完成前不会写回 home block；
 - 不宣称具备生产级 NAS 的多事务并发、barrier/FUA 矩阵。
