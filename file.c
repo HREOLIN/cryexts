@@ -221,8 +221,15 @@ static int cryexts_write_end(struct file *file,
 	return copied;
 }
 
+struct cryexts_writeback_context {
+	bool wrote_page;
+};
+
 static int cryexts_writepage_locked(struct page *page,
-				    struct writeback_control *wbc)
+				    struct writeback_control *wbc,
+				    bool own_transaction,
+				    bool sync_data,
+				    bool *wrote_page)
 {
 	struct inode *inode = page->mapping->host;
 	struct address_space *mapping = page->mapping;
@@ -247,10 +254,12 @@ static int cryexts_writepage_locked(struct page *page,
 
 	bytes = min_t(loff_t, PAGE_SIZE, size - page_start);
 	set_page_writeback(page);
-	err = cryexts_journal_begin(inode->i_sb);
-	if (err)
-		goto out_end_writeback;
-	txn_started = true;
+	if (own_transaction) {
+		err = cryexts_journal_begin(inode->i_sb);
+		if (err)
+			goto out_end_writeback;
+		txn_started = true;
+	}
 
 	flush_dcache_page(page);
 	page_buf = kmap_local_page(page);
@@ -268,9 +277,11 @@ static int cryexts_writepage_locked(struct page *page,
 						 page_buf + page_off);
 		if (err)
 			goto out_unmap;
-		err = cryexts_sync_inode_block(inode, physical);
-		if (err)
-			goto out_unmap;
+		if (sync_data) {
+			err = cryexts_sync_inode_block(inode, physical);
+			if (err)
+				goto out_unmap;
+		}
 	}
 	kunmap_local(page_buf);
 
@@ -278,11 +289,15 @@ static int cryexts_writepage_locked(struct page *page,
 	err = cryexts_write_inode_to_disk(inode);
 	if (err)
 		goto out_abort;
-	err = cryexts_journal_commit(inode->i_sb);
-	txn_started = false;
-	if (err)
-		goto out_end_writeback;
+	if (own_transaction) {
+		err = cryexts_journal_commit(inode->i_sb);
+		txn_started = false;
+		if (err)
+			goto out_end_writeback;
+	}
 
+	if (wrote_page)
+		*wrote_page = true;
 	ClearPageError(page);
 	unlock_page(page);
 	end_page_writeback(page);
@@ -312,22 +327,45 @@ out_redirty:
 static int cryexts_writepage(struct page *page,
 			     struct writeback_control *wbc)
 {
-	return cryexts_writepage_locked(page, wbc);
+	return cryexts_writepage_locked(page, wbc, true, true, NULL);
 }
 
 static int cryexts_writepages_callback(struct page *page,
 				       struct writeback_control *wbc,
 				       void *data)
 {
-	(void)data;
-	return cryexts_writepage_locked(page, wbc);
+	struct cryexts_writeback_context *ctx = data;
+
+	/* One writepages call shares its journal transaction across all pages. */
+	return cryexts_writepage_locked(page, wbc, false, false,
+					&ctx->wrote_page);
 }
 
-static int cryexts_writepages(struct address_space *mapping,
-			      struct writeback_control *wbc)
+static int cryexts_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
-	return write_cache_pages(mapping, wbc, cryexts_writepages_callback,
-				 NULL);
+	struct inode *inode = mapping->host;
+	struct cryexts_writeback_context ctx = { };
+	int err;
+
+	err = cryexts_journal_begin(inode->i_sb);
+	if (err)
+		return err;
+
+	err = write_cache_pages(mapping, wbc, cryexts_writepages_callback,
+				&ctx);
+	if (err) {
+		cryexts_journal_abort(inode->i_sb);
+		return err;
+	}
+	if (!ctx.wrote_page) {
+		cryexts_journal_abort(inode->i_sb);
+		return 0;
+	}
+
+	err = cryexts_journal_commit(inode->i_sb);
+	if (err)
+		return err;
+	return 0;
 }
 
 const struct address_space_operations cryexts_file_aops = {

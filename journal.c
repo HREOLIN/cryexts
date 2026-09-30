@@ -204,6 +204,17 @@ static int cryexts_sync_single_block(struct super_block *sb, u64 block)
 	return err;
 }
 
+static int cryexts_journal_ordered_barrier(struct super_block *sb)
+{
+	int err;
+
+	/* ponytail: one transaction-wide flush; per-bio FUA needs a BIO write path. */
+	err = sync_blockdev(sb->s_bdev);
+	if (err)
+		return err;
+	return blkdev_issue_flush(sb->s_bdev);
+}
+
 static void cryexts_journal_v2_set_sequence(struct super_block *sb, u64 sequence)
 {
 	struct cryexts_sb_info *sbi = CRYEXTS_SB(sb);
@@ -2584,6 +2595,12 @@ int cryexts_journal_commit(struct super_block *sb)
 		if (mutex_is_locked(&sbi->journal_lock))
 			mutex_unlock(&sbi->journal_lock);
 		return 0;
+	}
+	/* data=ordered: all prior data writeback must reach stable media first. */
+	err = cryexts_journal_ordered_barrier(sb);
+	if (err) {
+		cryexts_journal_abort(sb);
+		return err;
 	}
 	if (cryexts_journal_uses_v3(sb))
 		return cryexts_journal_v3_commit(sb);

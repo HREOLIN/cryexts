@@ -20,6 +20,9 @@ bash scripts/smoke_v12_2_background_checkpoint.sh
 log_step "ring recovery fault injection"
 bash scripts/smoke_v12_2_ring_recovery.sh
 
+log_step "ordered durability barrier"
+bash scripts/smoke_v12_3_ordered_durability.sh
+
 log_step "ring recovery soak"
 for iteration in 1 2; do
 	COMMITTED_IMG="cryexts-v12_2-soak-${iteration}-committed.img" \
@@ -29,5 +32,8 @@ for iteration in 1 2; do
 	FSCK_LOG="/tmp/cryexts-v12_2-soak-${iteration}-fsck.txt" \
 	bash scripts/smoke_v12_2_ring_recovery.sh
 done
+
+log_step "version 12 stability gate"
+bash scripts/smoke_v12_4_stability.sh
 
 echo "version12 MVP smoke test passed"
